@@ -52,6 +52,9 @@ appsettings.*.Local.json
 *.pem
 *.key
 
+# Local development notes
+DEVELOPMENT.md
+
 # Logs and temporary files
 *.log
 *.tmp
