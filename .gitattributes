@@ -1,0 +1,49 @@
+# Normalize repository text and keep checkouts consistent across platforms.
+* text=auto eol=lf
+
+# Source code, project files, configuration, and documentation.
+*.cs text eol=lf diff=csharp
+*.csproj text eol=lf
+*.props text eol=lf
+*.targets text eol=lf
+*.sln text eol=lf
+*.json text eol=lf
+*.jsonc text eol=lf
+*.js text eol=lf
+*.jsx text eol=lf
+*.ts text eol=lf
+*.tsx text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+*.svg text eol=lf
+*.md text eol=lf diff=markdown
+*.yml text eol=lf
+*.yaml text eol=lf
+*.sql text eol=lf
+*.ps1 text eol=lf
+*.sh text eol=lf
+
+# Windows command scripts require CRLF for legacy command processors.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary assets and archives must never be line-ending normalized.
+*.png binary -eol
+*.jpg binary -eol
+*.jpeg binary -eol
+*.gif binary -eol
+*.webp binary -eol
+*.ico binary -eol
+*.woff binary -eol
+*.woff2 binary -eol
+*.ttf binary -eol
+*.eot binary -eol
+*.pdf binary -eol
+*.zip binary -eol
+*.gz binary -eol
+*.br binary -eol
+*.7z binary -eol
+*.pfx binary -eol
+*.p12 binary -eol
+*.dll binary -eol
+*.exe binary -eol

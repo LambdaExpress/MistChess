@@ -1,0 +1,77 @@
+# .NET
+**/bin/
+**/obj/
+artifacts/
+TestResults/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.rsuser
+*.userprefs
+*.nupkg
+*.snupkg
+packages/
+BenchmarkDotNet.Artifacts/
+*.coverage
+*.coveragexml
+
+# IDEs and editors
+.vs/
+.vscode/
+.idea/
+_ReSharper*/
+*.DotSettings.user
+*.sln.iml
+
+# Node and frontend output
+**/node_modules/
+**/dist/
+**/coverage/
+playwright-report/
+test-results/
+blob-report/
+**/.vite/
+**/.cache/
+**/*.tsbuildinfo
+**/.eslintcache
+**/.stylelintcache
+**/playwright/.auth/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+appsettings.Local.json
+secrets.json
+appsettings.*.Local.json
+.envrc
+.direnv/
+*.pfx
+*.p12
+*.pem
+*.key
+
+# Logs and temporary files
+*.log
+*.tmp
+.tmp/
+*.bak
+*.swp
+.DS_Store
+Thumbs.db
+Desktop.ini
+.Spotlight-V100
+*.pid
+*.pid.lock
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Local database artifacts
+*.dump
+*.sql.gz
+*.backup
+*.sqlite
+*.sqlite3
