@@ -1,6 +1,24 @@
+import { useEffect, useSyncExternalStore } from 'react'
 import { NavLink, Outlet } from 'react-router'
+import { audioService } from '../features/audio/audioService'
 
 export function AppShell() {
+  const audioSettings = useSyncExternalStore(
+    audioService.subscribe,
+    audioService.getSettings,
+    audioService.getSettings,
+  )
+
+  useEffect(() => {
+    const unlock = () => void audioService.unlock()
+    window.addEventListener('pointerdown', unlock)
+    window.addEventListener('keydown', unlock)
+    return () => {
+      window.removeEventListener('pointerdown', unlock)
+      window.removeEventListener('keydown', unlock)
+    }
+  }, [])
+
   return (
     <div className="app-shell">
       <header className="site-header">
@@ -11,9 +29,33 @@ export function AppShell() {
             <small>MIST XIANGQI</small>
           </span>
         </NavLink>
-        <div className="header-rule">
-          <span className="status-dot" aria-hidden="true" />
-          fog-xiangqi-v1
+        <div className="header-actions">
+          <NavLink to="/history" className="header-link">历史对局</NavLink>
+          <div className="audio-settings" aria-label="音效设置">
+            <button
+              type="button"
+              aria-pressed={audioSettings.enabled}
+              onClick={() => audioService.setEnabled(!audioSettings.enabled)}
+            >
+              {audioSettings.enabled ? '音效开启' : '音效静音'}
+            </button>
+            <label>
+              <span>音量</span>
+              <input
+                type="range"
+                min="0"
+                max="100"
+                value={Math.round(audioSettings.volume * 100)}
+                disabled={!audioSettings.enabled}
+                aria-label="音效音量"
+                onChange={(event) => audioService.setVolume(Number(event.target.value) / 100)}
+              />
+            </label>
+          </div>
+          <div className="header-rule">
+            <span className="status-dot" aria-hidden="true" />
+            fog-xiangqi-v1
+          </div>
         </div>
       </header>
       <main className="app-main">

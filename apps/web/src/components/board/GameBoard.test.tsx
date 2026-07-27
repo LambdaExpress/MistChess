@@ -13,6 +13,7 @@ function createView(overrides: Partial<GameView> = {}): GameView {
   return {
     gameId: 'game-1',
     ruleVersion: 'fog-xiangqi-v1',
+    timeControl: null,
     version: 1,
     status: 'playing',
     result: null,
@@ -29,6 +30,7 @@ function createView(overrides: Partial<GameView> = {}): GameView {
     captureSummary: { redLost: [], blackLost: [] },
     clock: null,
     drawOffer: null,
+    ratingChange: null,
     ...overrides,
   }
 }

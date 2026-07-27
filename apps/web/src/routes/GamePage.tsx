@@ -1,16 +1,29 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useEffect, useRef, useState } from 'react'
-import { Link, useParams } from 'react-router'
+import { Link, useNavigate, useParams } from 'react-router'
 import { ApiError, api, errorMessage } from '../api/client'
 import { useGameHub, type RealtimeState } from '../api/hubs'
 import { queryKeys } from '../api/queryKeys'
-import type { DrawOffer, GameResult, GameView, PieceType, Position, Side } from '../api/types'
+import {
+  QUICK_MATCH_CLIENT_REQUEST_ID_KEY,
+  createClientId,
+  type DrawOffer,
+  type GameResult,
+  type GameView,
+  type GuestSession,
+  type MatchTicket,
+  type PieceType,
+  type Position,
+  type Side,
+} from '../api/types'
 import { ErrorPanel, PageLoader } from '../components/AppShell'
 import { GameBoard } from '../components/board/GameBoard'
 import {
   replaceWithAuthoritativeGameView,
   replaceWithNewerGameView,
 } from '../features/game/gameViewCache'
+import { audioService, type SoundEvent } from '../features/audio/audioService'
+import { interpolateClock } from '../features/game/clock'
 
 const sideNames: Record<Side, string> = { red: '红方', black: '黑方' }
 const pieceNames: Record<Side, Record<PieceType, string>> = {
@@ -33,8 +46,66 @@ const resultReasons: Record<GameResult['reason'], string> = {
   noProgress: '一百二十回合无进展',
 }
 
+type ClockSnapshot = {
+  version: number
+  redMilliseconds: number
+  blackMilliseconds: number
+  receivedAt: number
+  sideToMove: Side
+  playing: boolean
+}
+
+
+function useInterpolatedClock(view: GameView | undefined) {
+  const snapshotRef = useRef<ClockSnapshot | null>(null)
+  const [monotonicNow, setMonotonicNow] = useState(() => performance.now())
+
+  useEffect(() => {
+    if (!view?.clock) {
+      snapshotRef.current = null
+      return
+    }
+
+    const receivedAt = performance.now()
+    snapshotRef.current = {
+      version: view.version,
+      redMilliseconds: view.clock.redMilliseconds,
+      blackMilliseconds: view.clock.blackMilliseconds,
+      receivedAt,
+      sideToMove: view.sideToMove,
+      playing: view.status === 'playing',
+    }
+    setMonotonicNow(receivedAt)
+  }, [view])
+
+  useEffect(() => {
+    if (!view?.clock || view.status !== 'playing') return
+    const timer = window.setInterval(() => setMonotonicNow(performance.now()), 200)
+    return () => window.clearInterval(timer)
+  }, [view?.clock, view?.status])
+
+  const snapshot = snapshotRef.current
+  if (!snapshot) return view?.clock ?? null
+  const remaining = interpolateClock(
+    snapshot.redMilliseconds,
+    snapshot.blackMilliseconds,
+    snapshot.sideToMove,
+    snapshot.playing,
+    monotonicNow - snapshot.receivedAt,
+  )
+  return {
+    ...remaining,
+    serverTime: view?.clock?.serverTime ?? '',
+  }
+}
+
 function formatClock(milliseconds: number): string {
-  const totalSeconds = Math.max(0, Math.ceil(milliseconds / 1_000))
+  const safeMilliseconds = Math.max(0, milliseconds)
+  if (safeMilliseconds < 10_000) {
+    return (safeMilliseconds / 1_000).toFixed(1)
+  }
+
+  const totalSeconds = Math.ceil(safeMilliseconds / 1_000)
   const minutes = Math.floor(totalSeconds / 60).toString().padStart(2, '0')
   const seconds = (totalSeconds % 60).toString().padStart(2, '0')
   return `${minutes}:${seconds}`
@@ -42,6 +113,7 @@ function formatClock(milliseconds: number): string {
 
 export function GamePage() {
   const { gameId = '' } = useParams<{ gameId: string }>()
+  const navigate = useNavigate()
   const queryClient = useQueryClient()
   const [drawOffer, setDrawOffer] = useState<DrawOffer | null>(null)
   const [opponentConnected, setOpponentConnected] = useState(true)
@@ -50,6 +122,9 @@ export function GamePage() {
   const commandLock = useRef(false)
   const [commandPending, setCommandPending] = useState(false)
 
+  const previousView = useRef<GameView | null>(null)
+  const lowThresholds = useRef(new Set<number>())
+  const previousOwnRemaining = useRef<number | null>(null)
   const runCommand = (command: () => void) => {
     if (commandLock.current) return
     commandLock.current = true
@@ -74,6 +149,8 @@ export function GamePage() {
     retry: 1,
   })
   const view = gameQuery.data
+  const { refetch: refetchGame } = gameQuery
+  const interpolatedClock = useInterpolatedClock(view)
 
   useEffect(() => {
     setDrawOffer(view?.drawOffer ?? null)
@@ -92,7 +169,130 @@ export function GamePage() {
     onDrawOffer: setDrawOffer,
     onOpponentConnection: setOpponentConnected,
     onReconnect: () => {
-      void gameQuery.refetch()
+      void refetchGame()
+    },
+  })
+
+  useEffect(() => {
+    const refreshAfterVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        void refetchGame()
+      }
+    }
+    document.addEventListener('visibilitychange', refreshAfterVisibilityChange)
+    return () => document.removeEventListener('visibilitychange', refreshAfterVisibilityChange)
+  }, [refetchGame])
+
+  useEffect(() => {
+    if (!view) return
+    const previous = previousView.current
+    const startKey = `mistchess.audio.started.${view.gameId}`
+    const endKey = `mistchess.audio.ended.${view.gameId}.${view.version}`
+
+    if (!previous && view.status === 'playing' && !sessionStorage.getItem(startKey)) {
+      sessionStorage.setItem(startKey, '1')
+      audioService.emit(view.gameId, view.version, 'game-start')
+    }
+
+    if (view.status === 'finished' && view.result && !sessionStorage.getItem(endKey)) {
+      sessionStorage.setItem(endKey, '1')
+      const terminalEvent: SoundEvent = view.result.winner === null
+        ? 'game-draw'
+        : view.result.winner === view.perspective
+          ? 'game-win'
+          : 'game-loss'
+      audioService.emit(view.gameId, view.version, terminalEvent)
+    } else if (previous && view.version > previous.version) {
+      const captureCount = view.captureSummary.redLost.length +
+        view.captureSummary.blackLost.length
+      const previousCaptureCount = previous.captureSummary.redLost.length +
+        previous.captureSummary.blackLost.length
+      if (captureCount > previousCaptureCount) {
+        audioService.emit(view.gameId, view.version, 'capture')
+      } else if (view.sideToMove !== previous.sideToMove) {
+        const movingSide = view.sideToMove === 'red' ? 'black' : 'red'
+        audioService.emit(
+          view.gameId,
+          view.version,
+          movingSide === view.perspective ? 'move-self' : 'move-opponent',
+        )
+      }
+    }
+
+    previousView.current = view
+  }, [view])
+
+  useEffect(() => {
+    if (!view || !interpolatedClock || view.status !== 'playing') return
+    const remaining = view.perspective === 'red'
+      ? interpolatedClock.redMilliseconds
+      : interpolatedClock.blackMilliseconds
+    const previous = previousOwnRemaining.current
+    if (previous !== null) {
+      for (const threshold of [10_000, 5_000]) {
+        if (
+          previous > threshold &&
+          remaining <= threshold &&
+          !lowThresholds.current.has(threshold)
+        ) {
+          lowThresholds.current.add(threshold)
+          audioService.emit(
+            view.gameId,
+            view.version,
+            'clock-low',
+            threshold.toString(),
+          )
+        }
+      }
+    }
+    previousOwnRemaining.current = remaining
+  }, [interpolatedClock, view])
+
+  useEffect(() => {
+    const ratingChange = view?.ratingChange
+    if (!ratingChange) return
+    queryClient.setQueryData<GuestSession>(queryKeys.session, (session) => {
+      if (!session || session.rating.rating === ratingChange.after) return session
+      return {
+        ...session,
+        rating: {
+          ...session.rating,
+          rating: ratingChange.after,
+          gamesPlayed: session.rating.gamesPlayed + 1,
+        },
+      }
+    })
+  }, [queryClient, view?.ratingChange])
+
+  const rematch = useMutation<MatchTicket, unknown, void>({
+    mutationFn: async () => {
+      let clientRequestId = sessionStorage.getItem(QUICK_MATCH_CLIENT_REQUEST_ID_KEY)
+      if (!clientRequestId) {
+        clientRequestId = createClientId()
+        sessionStorage.setItem(QUICK_MATCH_CLIENT_REQUEST_ID_KEY, clientRequestId)
+      }
+      try {
+        return await api.createMatchTicket(clientRequestId)
+      } catch (error) {
+        if (error instanceof ApiError && error.code === 'ACTIVE_TICKET_EXISTS') {
+          return api.getCurrentMatchTicket()
+        }
+        throw error
+      }
+    },
+    onSuccess: (ticket) => {
+      queryClient.setQueryData(queryKeys.currentTicket, ticket)
+      sessionStorage.removeItem(QUICK_MATCH_CLIENT_REQUEST_ID_KEY)
+      void navigate('/match')
+    },
+    onError: (error) => {
+      if (
+        error instanceof ApiError &&
+        error.code === 'ACTIVE_GAME_EXISTS' &&
+        typeof error.problem.gameId === 'string'
+      ) {
+        void navigate(`/game/${encodeURIComponent(error.problem.gameId)}`)
+      }
     },
   })
 
@@ -102,13 +302,13 @@ export function GamePage() {
         from,
         to,
         expectedVersion: version,
-        clientMoveId: crypto.randomUUID(),
+        clientMoveId: createClientId(),
       }),
     onSuccess: storeView,
     onError: (error) => {
       if (error instanceof ApiError && error.code === 'STALE_VERSION') {
         setCommandError('棋局已更新，正在同步最新局面。')
-        void gameQuery.refetch()
+        void refetchGame()
       } else if (error instanceof ApiError && error.code === 'ILLEGAL_MOVE') {
         setCommandError('该走法无法执行，请根据最新候选落点重试。')
       } else {
@@ -156,7 +356,7 @@ export function GamePage() {
       <ErrorPanel
         title="无法恢复棋局"
         detail={errorMessage(gameQuery.error)}
-        onRetry={() => void gameQuery.refetch()}
+        onRetry={() => void refetchGame()}
       />
     )
   }
@@ -201,15 +401,39 @@ export function GamePage() {
         </section>
 
         <aside className="game-sidebar" aria-label="棋局状态与操作">
-          {view.clock ? (
+          {interpolatedClock ? (
             <section className="clock-card">
-              <div className={view.sideToMove === 'black' ? 'clock-row clock-row--active' : 'clock-row'}>
+              <div className={[
+                'clock-row',
+                view.sideToMove === 'black' ? 'clock-row--active' : '',
+                view.sideToMove === 'black' && interpolatedClock.blackMilliseconds < 10_000
+                  ? 'clock-row--low'
+                  : '',
+              ].filter(Boolean).join(' ')}>
                 <span className="side-token side-token--black">将</span>
-                <div><small>黑方</small><strong>{formatClock(view.clock.blackMilliseconds)}</strong></div>
+                <div>
+                  <small>黑方</small>
+                  <strong>{formatClock(interpolatedClock.blackMilliseconds)}</strong>
+                  {view.sideToMove === 'black' && interpolatedClock.blackMilliseconds < 10_000
+                    ? <em>时间不足</em>
+                    : null}
+                </div>
               </div>
-              <div className={view.sideToMove === 'red' ? 'clock-row clock-row--active' : 'clock-row'}>
+              <div className={[
+                'clock-row',
+                view.sideToMove === 'red' ? 'clock-row--active' : '',
+                view.sideToMove === 'red' && interpolatedClock.redMilliseconds < 10_000
+                  ? 'clock-row--low'
+                  : '',
+              ].filter(Boolean).join(' ')}>
                 <span className="side-token side-token--red">帅</span>
-                <div><small>红方</small><strong>{formatClock(view.clock.redMilliseconds)}</strong></div>
+                <div>
+                  <small>红方</small>
+                  <strong>{formatClock(interpolatedClock.redMilliseconds)}</strong>
+                  {view.sideToMove === 'red' && interpolatedClock.redMilliseconds < 10_000
+                    ? <em>时间不足</em>
+                    : null}
+                </div>
               </div>
             </section>
           ) : (
@@ -227,7 +451,30 @@ export function GamePage() {
               <p className="page-kicker">FINAL RESULT</p>
               <h2>{view.result.winner ? `${sideNames[view.result.winner]}获胜` : '本局和棋'}</h2>
               <p>{resultReasons[view.result.reason]}</p>
-              <Link className="button button--accent button--wide" to={`/game/${encodeURIComponent(gameId)}/replay`}>
+              {view.ratingChange ? (
+                <div className="rating-change" aria-label="本局匹配分变化">
+                  <span>{view.ratingChange.before}</span>
+                  <span aria-hidden="true">→</span>
+                  <strong>{view.ratingChange.after}</strong>
+                  <em>
+                    {view.ratingChange.delta >= 0 ? '+' : ''}
+                    {view.ratingChange.delta}
+                  </em>
+                </div>
+              ) : null}
+              <button
+                type="button"
+                className="button button--accent button--wide"
+                disabled={rematch.isPending}
+                aria-busy={rematch.isPending}
+                onClick={() => rematch.mutate()}
+              >
+                {rematch.isPending ? '正在创建匹配…' : '重新匹配'}
+              </button>
+              {rematch.isError ? (
+                <p className="inline-error" role="alert">{errorMessage(rematch.error)}</p>
+              ) : null}
+              <Link className="button button--secondary button--wide" to={`/history/${encodeURIComponent(gameId)}`}>
                 查看完整回放
               </Link>
             </section>

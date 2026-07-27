@@ -4,7 +4,9 @@ import { Link, useNavigate } from 'react-router'
 import { api, errorMessage, matchCreatedGameId } from '../api/client'
 import { useLobbyHub, type RealtimeState } from '../api/hubs'
 import { queryKeys } from '../api/queryKeys'
+import { createClientId } from '../api/types'
 import { ErrorPanel, PageLoader } from '../components/AppShell'
+import { audioService } from '../features/audio/audioService'
 
 const realtimeLabels: Record<RealtimeState, string> = {
   connecting: '正在连接大厅',
@@ -34,10 +36,12 @@ export function MatchPage() {
     onTicket: (ticket) => {
       queryClient.setQueryData(queryKeys.currentTicket, ticket)
       if (ticket.status === 'matched' && ticket.gameId) {
+        audioService.emit(ticket.gameId, 0, 'match-found')
         void navigate(`/game/${encodeURIComponent(ticket.gameId)}`)
       }
     },
     onMatch: (match) => {
+      audioService.emit(match.gameId, 0, 'match-found')
       void navigate(`/game/${encodeURIComponent(match.gameId)}`)
     },
     onReconnect: () => {
@@ -129,7 +133,7 @@ export function MatchPage() {
         </div>
         <p className="page-kicker">MATCHMAKING</p>
         <h1 id="match-title">
-          {isSearching ? '正在迷雾中寻找对手' : ticket.status === 'expired' ? '匹配票据已过期' : '匹配状态已更新'}
+          {isSearching ? '正在为你匹配对手…' : ticket.status === 'expired' ? '匹配票据已过期' : '匹配状态已更新'}
         </h1>
         <p className="match-subtitle">
           {isSearching
@@ -165,7 +169,7 @@ export function MatchPage() {
             type="button"
             className="button button--accent button--wide"
             disabled={restart.isPending}
-            onClick={() => restart.mutate(crypto.randomUUID())}
+            onClick={() => restart.mutate(createClientId())}
           >
             {restart.isPending ? '正在重新入池…' : '重新寻找对手'}
           </button>

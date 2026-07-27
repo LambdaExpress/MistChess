@@ -4,18 +4,38 @@ import { MemoryRouter, Route, Routes } from 'react-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError, api } from '../api/client'
 import { queryKeys } from '../api/queryKeys'
-import type { MatchTicket } from '../api/types'
+import type { GameOptions, MatchTicket } from '../api/types'
 import { HomePage } from './HomePage'
 
 const ticket: MatchTicket = {
   ticketId: 'ticket-1',
   ruleVersion: 'fog-xiangqi-v1',
-  timeControl: null,
+  timeControl: '600+5',
   status: 'searching',
   createdAt: '2026-07-26T00:00:00Z',
   lastHeartbeatAt: '2026-07-26T00:00:00Z',
   expiresAt: '2026-07-26T00:01:00Z',
   gameId: null,
+}
+
+const gameOptions: GameOptions = {
+  ruleVersion: 'fog-xiangqi-v1',
+  quickMatchTimeControl: {
+    id: '600+5',
+    label: '10 分钟 + 5 秒',
+    initialSeconds: 600,
+    incrementSeconds: 5,
+  },
+  roomTimeControls: [
+    {
+      id: '180+2',
+      label: '3 分钟 + 2 秒',
+      initialSeconds: 180,
+      incrementSeconds: 2,
+    },
+  ],
+  defaultRoomTimeControlId: '180+2',
+  allowUntimedRooms: true,
 }
 
 function renderHomePage() {
@@ -42,6 +62,7 @@ function renderHomePage() {
 
 beforeEach(() => {
   sessionStorage.clear()
+  vi.spyOn(api, 'getGameOptions').mockResolvedValue(gameOptions)
 })
 
 afterEach(() => {
@@ -57,7 +78,9 @@ describe('HomePage quick match recovery', () => {
       .mockResolvedValueOnce(ticket)
 
     const firstView = renderHomePage()
-    fireEvent.click(screen.getByRole('button', { name: '寻找对手' }))
+    const firstMatchButton = screen.getByRole('button', { name: '寻找对手' })
+    await waitFor(() => expect(firstMatchButton).toBeEnabled())
+    fireEvent.click(firstMatchButton)
 
     expect(await screen.findByRole('alert')).toHaveTextContent('Failed to fetch')
     expect(createMatchTicket).toHaveBeenCalledOnce()
@@ -67,7 +90,9 @@ describe('HomePage quick match recovery', () => {
 
     firstView.unmount()
     const secondView = renderHomePage()
-    fireEvent.click(screen.getByRole('button', { name: '寻找对手' }))
+    const secondMatchButton = screen.getByRole('button', { name: '寻找对手' })
+    await waitFor(() => expect(secondMatchButton).toBeEnabled())
+    fireEvent.click(secondMatchButton)
 
     expect(await screen.findByText('Matching')).toBeInTheDocument()
     expect(createMatchTicket).toHaveBeenCalledTimes(2)
@@ -87,7 +112,9 @@ describe('HomePage quick match recovery', () => {
       .mockResolvedValue(ticket)
 
     const { queryClient } = renderHomePage()
-    fireEvent.click(screen.getByRole('button', { name: '寻找对手' }))
+    const matchButton = screen.getByRole('button', { name: '寻找对手' })
+    await waitFor(() => expect(matchButton).toBeEnabled())
+    fireEvent.click(matchButton)
 
     expect(await screen.findByText('Matching')).toBeInTheDocument()
     expect(getCurrentMatchTicket).toHaveBeenCalledOnce()

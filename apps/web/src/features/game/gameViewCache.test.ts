@@ -9,6 +9,7 @@ function snapshot(version: number): GameView {
   return {
     gameId: 'game-1',
     ruleVersion: 'fog-xiangqi-v1',
+    timeControl: null,
     version,
     status: 'playing',
     result: null,
@@ -20,6 +21,7 @@ function snapshot(version: number): GameView {
     captureSummary: { redLost: [], blackLost: [] },
     clock: null,
     drawOffer: null,
+    ratingChange: null,
   }
 }
 

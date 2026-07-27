@@ -1,16 +1,32 @@
-import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useState, type FormEvent } from 'react'
 import { useNavigate } from 'react-router'
 import { ApiError, api, errorMessage } from '../api/client'
 import { queryKeys } from '../api/queryKeys'
-import { RULE_VERSION, type MatchTicket } from '../api/types'
+import {
+  QUICK_MATCH_CLIENT_REQUEST_ID_KEY,
+  createClientId,
+  RULE_VERSION,
+  type GuestSession,
+  type MatchTicket,
+} from '../api/types'
 
-const QUICK_MATCH_CLIENT_REQUEST_ID_KEY = 'mistchess.quickMatch.clientRequestId'
 
 export function HomePage() {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const [roomCode, setRoomCode] = useState('')
+  const [roomTimeControl, setRoomTimeControl] = useState('')
+  const sessionQuery = useQuery<GuestSession>({
+    queryKey: queryKeys.session,
+    queryFn: api.startGuestSession,
+    staleTime: Number.POSITIVE_INFINITY,
+  })
+  const optionsQuery = useQuery({
+    queryKey: queryKeys.gameOptions,
+    queryFn: api.getGameOptions,
+    staleTime: Number.POSITIVE_INFINITY,
+  })
 
   const enterMatch = (ticket: MatchTicket) => {
     queryClient.setQueryData(queryKeys.currentTicket, ticket)
@@ -55,13 +71,21 @@ export function HomePage() {
   const startQuickMatch = () => {
     let clientRequestId = sessionStorage.getItem(QUICK_MATCH_CLIENT_REQUEST_ID_KEY)
     if (!clientRequestId) {
-      clientRequestId = crypto.randomUUID()
+      clientRequestId = createClientId()
       sessionStorage.setItem(QUICK_MATCH_CLIENT_REQUEST_ID_KEY, clientRequestId)
     }
     startMatch.mutate(clientRequestId)
   }
 
+  const options = optionsQuery.data
+  const selectedRoomTimeControl = roomTimeControl ||
+    options?.defaultRoomTimeControlId ||
+    ''
+  const roomTimeControlRequest = selectedRoomTimeControl === 'untimed'
+    ? null
+    : selectedRoomTimeControl
   const activeError = createRoom.error ?? joinRoom.error ?? startMatch.error
+    ?? optionsQuery.error
   const busy = createRoom.isPending || joinRoom.isPending || startMatch.isPending
 
   return (
@@ -88,16 +112,25 @@ export function HomePage() {
           <div className="entry-card__number" aria-hidden="true">01</div>
           <p className="entry-card__kicker">QUICK MATCH</p>
           <h2>快速匹配</h2>
-          <p>进入无计时匹配池，系统随机分配红黑方，配对后立即开始。</p>
+          <p>固定 10 分钟基础时间，每次合法非终局走子增加 5 秒；系统优先安排实力接近的对手。</p>
+          <div className="rating-summary">
+            <span>当前匹配分</span>
+            <strong>
+              {sessionQuery.data?.rating.gamesPlayed
+                ? sessionQuery.data.rating.rating
+                : `暂定 ${sessionQuery.data?.rating.rating ?? 1500}`}
+            </strong>
+            <small>分数会随已完成的快速匹配对局调整</small>
+          </div>
           <button
             type="button"
             className="button button--accent button--wide"
-            disabled={busy}
+            disabled={busy || !options}
             onClick={startQuickMatch}
           >
             {startMatch.isPending ? '正在入池…' : '寻找对手'}
           </button>
-          <small>{RULE_VERSION} · 无计时</small>
+          <small>{RULE_VERSION} · {options?.quickMatchTimeControl.label ?? '10 分钟 + 5 秒'}</small>
         </article>
 
         <article className="entry-card">
@@ -105,11 +138,25 @@ export function HomePage() {
           <p className="entry-card__kicker">PRIVATE ROOM</p>
           <h2>好友房间</h2>
           <p>创建专属房间，把房间码发给好友，双方准备后开局。</p>
+          <label className="room-time-control" htmlFor="room-time-control">
+            <span>计时模式</span>
+            <select
+              id="room-time-control"
+              value={selectedRoomTimeControl}
+              disabled={busy || !options}
+              onChange={(event) => setRoomTimeControl(event.target.value)}
+            >
+              {options?.roomTimeControls.map((option) => (
+                <option key={option.id} value={option.id}>{option.label}</option>
+              ))}
+              {options?.allowUntimedRooms ? <option value="untimed">无计时</option> : null}
+            </select>
+          </label>
           <button
             type="button"
             className="button button--secondary button--wide"
-            disabled={busy}
-            onClick={() => createRoom.mutate()}
+            disabled={busy || !options}
+            onClick={() => createRoom.mutate(roomTimeControlRequest)}
           >
             {createRoom.isPending ? '正在创建…' : '创建房间'}
           </button>

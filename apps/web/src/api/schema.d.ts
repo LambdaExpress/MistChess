@@ -1,4 +1,20 @@
 export interface paths {
+    "/api/game-options": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["getGameOptions"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/sessions/guest": {
         parameters: {
             query?: never;
@@ -159,6 +175,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/games/history": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["getGameHistory"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/games/{gameId}": {
         parameters: {
             query?: never;
@@ -271,6 +303,38 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/games/{gameId}/replay-share": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["createReplayShare"];
+        delete: operations["revokeReplayShare"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/replay-shares/{shareToken}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["getSharedReplay"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -297,7 +361,6 @@ export interface components {
         };
         CreateMatchTicketRequest: {
             ruleVersion: string;
-            timeControl: null | string;
             clientRequestId: string;
         };
         CreateRoomRequest: {
@@ -317,6 +380,13 @@ export interface components {
             /** Format: uuid */
             gameId?: null | string;
         };
+        GameOptionsView: {
+            ruleVersion: string;
+            quickMatchTimeControl: components["schemas"]["TimeControlOptionView"];
+            roomTimeControls: components["schemas"]["TimeControlOptionView"][];
+            defaultRoomTimeControlId: string;
+            allowUntimedRooms: boolean;
+        };
         /** @enum {string} */
         GameResultReason: "generalCaptured" | "noLegalMove" | "resignation" | "timeout" | "agreedDraw" | "repetition" | "noProgress";
         GameResultView: {
@@ -329,6 +399,7 @@ export interface components {
             /** Format: uuid */
             gameId: string;
             ruleVersion: string;
+            timeControl: null | string;
             /** Format: int64 */
             version: number;
             status: components["schemas"]["GameStatus"];
@@ -341,11 +412,57 @@ export interface components {
             captureSummary: components["schemas"]["CaptureSummaryView"];
             clock: null | components["schemas"]["ClockView"];
             drawOffer: null | components["schemas"]["DrawOfferView"];
+            ratingChange: null | components["schemas"]["RatingChangeView"];
         };
         GuestSessionView: {
             /** Format: uuid */
             playerId: string;
             displayName: string;
+            rating: components["schemas"]["PlayerRatingView"];
+        };
+        HistoricalGamesPageView: {
+            games: components["schemas"]["HistoricalGameSummaryView"][];
+            nextCursor: null | string;
+        };
+        HistoricalGameSummaryView: {
+            /** Format: uuid */
+            gameId: string;
+            /** Format: date-time */
+            finishedAt: string;
+            ruleVersion: string;
+            timeControl: null | string;
+            currentPlayerSide: components["schemas"]["Side"];
+            red: components["schemas"]["HistoricalPlayerView"];
+            black: components["schemas"]["HistoricalPlayerView"];
+            result: components["schemas"]["GameResultView"];
+            /** Format: int32 */
+            plyCount: number;
+        };
+        /** @enum {string} */
+        HistoricalOutcome: "win" | "loss" | "draw";
+        HistoricalPlayerView: {
+            displayName: string;
+            outcome: components["schemas"]["HistoricalOutcome"];
+            /** Format: int32 */
+            ratingBefore: null | number;
+        };
+        HistoricalReplayFrameView: {
+            /** Format: int32 */
+            ply: number;
+            sideToMove: components["schemas"]["Side"];
+            clock: null | components["schemas"]["ClockView"];
+            views: components["schemas"]["ReplayFrameViewsView"];
+        };
+        HistoricalReplayView: {
+            /** Format: uuid */
+            gameId: string;
+            ruleVersion: string;
+            timeControl: null | string;
+            currentPlayerSide: null | components["schemas"]["Side"];
+            red: components["schemas"]["HistoricalPlayerView"];
+            black: components["schemas"]["HistoricalPlayerView"];
+            result: components["schemas"]["GameResultView"];
+            frames: components["schemas"]["HistoricalReplayFrameView"][];
         };
         /** @enum {string} */
         MatchTicketStatus: "searching" | "matched" | "cancelled" | "expired";
@@ -378,18 +495,38 @@ export interface components {
             type: components["schemas"]["PieceType"];
             position: components["schemas"]["Position"];
         };
+        PlayerRatingView: {
+            ruleVersion: string;
+            timeControl: string;
+            /** Format: int32 */
+            rating: number;
+            /** Format: int32 */
+            gamesPlayed: number;
+        };
         Position: {
             /** Format: int32 */
             file: number;
             /** Format: int32 */
             rank: number;
         };
-        ReplayFrameView: {
+        RatingChangeView: {
             /** Format: int32 */
-            ply: number;
-            sideToMove: components["schemas"]["Side"];
+            before: number;
+            /** Format: int32 */
+            after: number;
+            /** Format: int32 */
+            delta: number;
+        };
+        ReplayFrameProjectionView: {
+            visibleSquares: components["schemas"]["Position"][];
             pieces: components["schemas"]["PieceView"][];
+            captureSummary: components["schemas"]["CaptureSummaryView"];
             move: null | components["schemas"]["ReplayMoveView"];
+        };
+        ReplayFrameViewsView: {
+            red: components["schemas"]["ReplayFrameProjectionView"];
+            black: components["schemas"]["ReplayFrameProjectionView"];
+            omniscient: components["schemas"]["ReplayFrameProjectionView"];
         };
         ReplayMoveView: {
             /** Format: int32 */
@@ -400,13 +537,10 @@ export interface components {
             to: components["schemas"]["Position"];
             captured: null | components["schemas"]["PieceType"];
         };
-        ReplayView: {
-            /** Format: uuid */
-            gameId: string;
-            ruleVersion: string;
-            perspective: components["schemas"]["Side"];
-            result: components["schemas"]["GameResultView"];
-            frames: components["schemas"]["ReplayFrameView"][];
+        ReplayShareCreatedView: {
+            sharePath: string;
+            /** Format: date-time */
+            createdAt: string;
         };
         RoomPlayerView: {
             displayName: string;
@@ -428,6 +562,14 @@ export interface components {
         };
         /** @enum {string} */
         Side: "red" | "black";
+        TimeControlOptionView: {
+            id: string;
+            label: string;
+            /** Format: int32 */
+            initialSeconds: number;
+            /** Format: int32 */
+            incrementSeconds: number;
+        };
     };
     responses: never;
     parameters: never;
@@ -437,6 +579,28 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    getGameOptions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": components["schemas"]["GameOptionsView"];
+                    "application/json": components["schemas"]["GameOptionsView"];
+                    "text/json": components["schemas"]["GameOptionsView"];
+                };
+            };
+        };
+    };
     createGuestSession: {
         parameters: {
             query?: never;
@@ -736,6 +900,34 @@ export interface operations {
             };
         };
     };
+    getGameHistory: {
+        parameters: {
+            query?: {
+                cursor?: string;
+                limit?: number;
+                ruleVersion?: string;
+                timeControl?: string;
+                result?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": components["schemas"]["HistoricalGamesPageView"];
+                    "application/json": components["schemas"]["HistoricalGamesPageView"];
+                    "text/json": components["schemas"]["HistoricalGamesPageView"];
+                };
+            };
+        };
+    };
     getGame: {
         parameters: {
             query?: never;
@@ -936,9 +1128,110 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "text/plain": components["schemas"]["ReplayView"];
-                    "application/json": components["schemas"]["ReplayView"];
-                    "text/json": components["schemas"]["ReplayView"];
+                    "text/plain": components["schemas"]["HistoricalReplayView"];
+                    "application/json": components["schemas"]["HistoricalReplayView"];
+                    "text/json": components["schemas"]["HistoricalReplayView"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": components["schemas"]["ErrorResponse"];
+                    "application/json": components["schemas"]["ErrorResponse"];
+                    "text/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    createReplayShare: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                gameId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": components["schemas"]["ReplayShareCreatedView"];
+                    "application/json": components["schemas"]["ReplayShareCreatedView"];
+                    "text/json": components["schemas"]["ReplayShareCreatedView"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": components["schemas"]["ErrorResponse"];
+                    "application/json": components["schemas"]["ErrorResponse"];
+                    "text/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    revokeReplayShare: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                gameId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description No Content */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": components["schemas"]["ErrorResponse"];
+                    "application/json": components["schemas"]["ErrorResponse"];
+                    "text/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    getSharedReplay: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                shareToken: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": components["schemas"]["HistoricalReplayView"];
+                    "application/json": components["schemas"]["HistoricalReplayView"];
+                    "text/json": components["schemas"]["HistoricalReplayView"];
                 };
             };
             /** @description Not Found */

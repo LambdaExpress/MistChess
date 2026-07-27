@@ -57,11 +57,18 @@ async function requestJson<TOperation extends keyof operations>(
 
   const response = await fetch(path, {
     ...init,
-    credentials: 'include',
+    credentials: init?.credentials ?? 'include',
     headers,
   })
 
   if (!response.ok) {
+    if (
+      response.status === 401 &&
+      path !== '/api/sessions/guest' &&
+      typeof window !== 'undefined'
+    ) {
+      window.dispatchEvent(new Event('mistchess:session-invalid'))
+    }
     let problem: ApiProblem = {
       code: 'REQUEST_FAILED',
       title: response.statusText || 'Request failed',
@@ -86,12 +93,32 @@ export const api = {
   startGuestSession: () =>
     requestJson<'createGuestSession'>('/api/sessions/guest', { method: 'POST' }),
 
-  createRoom: () =>
+  getGameOptions: () =>
+    requestJson<'getGameOptions'>('/api/game-options'),
+
+  getGameHistory: (params: {
+    cursor?: string
+    limit?: number
+    ruleVersion?: string
+    timeControl?: string
+    result?: string
+  }) => {
+    const search = new URLSearchParams()
+    if (params.cursor) search.set('cursor', params.cursor)
+    if (params.limit) search.set('limit', params.limit.toString())
+    if (params.ruleVersion) search.set('ruleVersion', params.ruleVersion)
+    if (params.timeControl) search.set('timeControl', params.timeControl)
+    if (params.result) search.set('result', params.result)
+    const query = search.size ? `?${search.toString()}` : ''
+    return requestJson<'getGameHistory'>(`/api/games/history${query}`)
+  },
+
+  createRoom: (timeControl: string | null) =>
     requestJson<'createRoom'>('/api/rooms', {
       method: 'POST',
       body: jsonBody<JsonRequest<'createRoom'>>({
         ruleVersion: RULE_VERSION,
-        timeControl: null,
+        timeControl,
       }),
     }),
 
@@ -116,7 +143,6 @@ export const api = {
       method: 'POST',
       body: jsonBody<JsonRequest<'createMatchTicket'>>({
         ruleVersion: RULE_VERSION,
-        timeControl: null,
         clientRequestId,
       }),
     }),
@@ -169,6 +195,24 @@ export const api = {
 
   getReplay: (gameId: string) =>
     requestJson<'getReplay'>(`/api/games/${encodeURIComponent(gameId)}/replay`),
+
+  createReplayShare: (gameId: string) =>
+    requestJson<'createReplayShare'>(
+      `/api/games/${encodeURIComponent(gameId)}/replay-share`,
+      { method: 'POST' },
+    ),
+
+  revokeReplayShare: (gameId: string) =>
+    requestJson<'revokeReplayShare'>(
+      `/api/games/${encodeURIComponent(gameId)}/replay-share`,
+      { method: 'DELETE' },
+    ),
+
+  getSharedReplay: (shareToken: string) =>
+    requestJson<'getSharedReplay'>(
+      `/api/replay-shares/${encodeURIComponent(shareToken)}`,
+      { credentials: 'omit' },
+    ),
 }
 
 export function errorMessage(error: unknown): string {
