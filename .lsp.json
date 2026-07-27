@@ -1,0 +1,100 @@
+{
+  "servers": {
+    "csharp-ls": {
+      "command": "dotnet.exe",
+      "args": [
+        "tool",
+        "run",
+        "csharp-ls",
+        "--",
+        "--solution",
+        "MistChess.sln"
+      ],
+      "fileTypes": [
+        ".cs",
+        ".csx"
+      ],
+      "rootMarkers": [
+        "MistChess.sln",
+        ".git"
+      ]
+    },
+    "typescript-language-server": {
+      "command": "npx.cmd",
+      "args": [
+        "--prefix",
+        "apps/web",
+        "--no-install",
+        "typescript-language-server",
+        "--stdio"
+      ],
+      "fileTypes": [
+        ".ts",
+        ".tsx",
+        ".js",
+        ".jsx",
+        ".mjs",
+        ".cjs"
+      ],
+      "rootMarkers": [
+        "MistChess.sln",
+        ".git"
+      ]
+    },
+    "vscode-css-language-server": {
+      "command": "npx.cmd",
+      "args": [
+        "--prefix",
+        "apps/web",
+        "--no-install",
+        "vscode-css-language-server",
+        "--stdio"
+      ],
+      "fileTypes": [
+        ".css",
+        ".scss",
+        ".less"
+      ],
+      "rootMarkers": [
+        "MistChess.sln",
+        ".git"
+      ]
+    },
+    "vscode-html-language-server": {
+      "command": "npx.cmd",
+      "args": [
+        "--prefix",
+        "apps/web",
+        "--no-install",
+        "vscode-html-language-server",
+        "--stdio"
+      ],
+      "fileTypes": [
+        ".html",
+        ".htm"
+      ],
+      "rootMarkers": [
+        "MistChess.sln",
+        ".git"
+      ]
+    },
+    "vscode-json-language-server": {
+      "command": "npx.cmd",
+      "args": [
+        "--prefix",
+        "apps/web",
+        "--no-install",
+        "vscode-json-language-server",
+        "--stdio"
+      ],
+      "fileTypes": [
+        ".json",
+        ".jsonc"
+      ],
+      "rootMarkers": [
+        "MistChess.sln",
+        ".git"
+      ]
+    }
+  }
+}
