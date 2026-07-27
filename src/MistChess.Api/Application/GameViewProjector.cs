@@ -17,14 +17,15 @@ public sealed class GameViewProjector(IGameStateSerializer stateSerializer, Time
             game.Id,
             game.RuleVersion,
             game.TimeControl,
+            game.MoveTimeLimitMilliseconds,
             game.Version,
             game.Status,
             game.Winner,
             game.ResultReason,
-            game.RatingSettlement,
             game.RedMilliseconds,
             game.BlackMilliseconds,
             game.TurnStartedAt,
+            game.TurnMilliseconds,
             state,
             GameFactory.GetSide(game, playerId),
             timeProvider.GetUtcNow(),
@@ -39,14 +40,15 @@ public sealed class GameViewProjector(IGameStateSerializer stateSerializer, Time
             game.Id,
             game.RuleVersion,
             game.TimeControl,
+            game.MoveTimeLimitMilliseconds,
             move.GameVersion,
             status,
             move.WinnerAfter,
             move.ResultReasonAfter,
-            game.RatingSettlement,
             move.RedMillisecondsAfter,
             move.BlackMillisecondsAfter,
             move.TurnStartedAtAfter,
+            move.TurnMillisecondsAfter,
             state,
             GameFactory.GetSide(game, playerId),
             move.CreatedAt,
@@ -63,14 +65,15 @@ public sealed class GameViewProjector(IGameStateSerializer stateSerializer, Time
             game.Id,
             game.RuleVersion,
             game.TimeControl,
+            game.MoveTimeLimitMilliseconds,
             receipt.GameVersion,
             status,
             receipt.WinnerAfter,
             receipt.ResultReasonAfter,
-            game.RatingSettlement,
             receipt.RedMillisecondsAfter,
             receipt.BlackMillisecondsAfter,
             receipt.TurnStartedAtAfter,
+            receipt.TurnMillisecondsAfter,
             state,
             GameFactory.GetSide(game, playerId),
             receipt.CreatedAt,
@@ -155,14 +158,15 @@ public sealed class GameViewProjector(IGameStateSerializer stateSerializer, Time
         Guid gameId,
         string ruleVersion,
         string? timeControl,
+        long? moveTimeLimitMilliseconds,
         long version,
         GameStatus status,
         Side? winner,
         string? resultReason,
-        RatingSettlementEntity? ratingSettlement,
         long? redMilliseconds,
         long? blackMilliseconds,
         DateTimeOffset? turnStartedAt,
+        long? turnMilliseconds,
         GameState state,
         Side perspective,
         DateTimeOffset now,
@@ -180,22 +184,20 @@ public sealed class GameViewProjector(IGameStateSerializer stateSerializer, Time
             redMilliseconds,
             blackMilliseconds,
             turnStartedAt,
+            turnMilliseconds,
             state.SideToMove,
             status,
             now);
-        var ratingChange = status == GameStatus.Finished
-            ? MapRatingChange(ratingSettlement, perspective)
-            : null;
         return ToApiView(
             gameId,
             timeControl,
+            ToSeconds(moveTimeLimitMilliseconds),
             version,
             status,
             result,
             domainProjection,
             clock,
-            drawOffer,
-            ratingChange);
+            drawOffer);
     }
 
     private static GameState PrepareProjectionState(
@@ -220,13 +222,13 @@ public sealed class GameViewProjector(IGameStateSerializer stateSerializer, Time
     private static ApiGameView ToApiView(
         Guid gameId,
         string? timeControl,
+        int? moveTimeLimitSeconds,
         long version,
         GameStatus status,
         GameResultView? result,
         DomainGameView projection,
         ClockView? clock,
-        DrawOfferView? drawOffer,
-        RatingChangeView? ratingChange)
+        DrawOfferView? drawOffer)
     {
         return new ApiGameView(
             gameId,
@@ -247,31 +249,15 @@ public sealed class GameViewProjector(IGameStateSerializer stateSerializer, Time
                 projection.CaptureSummary.BlackLost.ToArray()),
             clock,
             status == GameStatus.Playing ? drawOffer : null,
-            ratingChange);
+            moveTimeLimitSeconds);
     }
 
 
-    private static RatingChangeView? MapRatingChange(
-        RatingSettlementEntity? settlement,
-        Side perspective)
-    {
-        if (settlement is null)
-        {
-            return null;
-        }
-
-        var before = perspective == Side.Red
-            ? settlement.RedRatingBefore
-            : settlement.BlackRatingBefore;
-        var after = perspective == Side.Red
-            ? settlement.RedRatingAfter
-            : settlement.BlackRatingAfter;
-        return new RatingChangeView(before, after, after - before);
-    }
     private static ClockView? ComputeClock(
         long? redMilliseconds,
         long? blackMilliseconds,
         DateTimeOffset? turnStartedAt,
+        long? turnMilliseconds,
         Side sideToMove,
         GameStatus status,
         DateTimeOffset now)
@@ -283,6 +269,7 @@ public sealed class GameViewProjector(IGameStateSerializer stateSerializer, Time
 
         var red = redMilliseconds.Value;
         var black = blackMilliseconds.Value;
+        var turn = turnMilliseconds;
         if (status == GameStatus.Playing && turnStartedAt is { } started)
         {
             var elapsed = Math.Max(0, (long)(now - started).TotalMilliseconds);
@@ -294,10 +281,17 @@ public sealed class GameViewProjector(IGameStateSerializer stateSerializer, Time
             {
                 black = Math.Max(0, black - elapsed);
             }
+            if (turn is not null)
+            {
+                turn = Math.Max(0, turn.Value - elapsed);
+            }
         }
 
-        return new ClockView(red, black, now);
+        return new ClockView(red, black, now, turn);
     }
+
+    private static int? ToSeconds(long? milliseconds) =>
+        milliseconds is null ? null : checked((int)(milliseconds.Value / 1000));
 
     private static GameResultView? BuildResult(GameStatus status, Side? winner, string? reason) =>
         status == GameStatus.Finished && reason is not null

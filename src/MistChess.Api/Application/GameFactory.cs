@@ -50,6 +50,9 @@ public static class GameOptionsCatalog
 {
     public const string QuickMatchTimeControlId = "600+5";
     public const string DefaultRoomTimeControlId = "180+2";
+    public const int QuickMatchMoveTimeLimitSeconds = 90;
+    public const int DefaultRoomMoveTimeLimitSeconds = 90;
+    public const long QuickMatchMoveTimeLimitMilliseconds = QuickMatchMoveTimeLimitSeconds * 1000L;
 
     private static readonly TimeControlOptionView QuickMatchOption =
         new(QuickMatchTimeControlId, "10 分钟 + 5 秒", 600, 5);
@@ -61,12 +64,23 @@ public static class GameOptionsCatalog
         QuickMatchOption
     ];
 
+    private static readonly IReadOnlyList<MoveTimeLimitOptionView> RoomMoveTimeLimits =
+    [
+        new(30, "30 秒"),
+        new(60, "60 秒"),
+        new(90, "90 秒"),
+        new(120, "120 秒")
+    ];
+
     public static GameOptionsView View { get; } = new(
         GameState.CurrentRuleVersion,
         QuickMatchOption,
         RoomOptions,
         DefaultRoomTimeControlId,
-        true);
+        true,
+        QuickMatchMoveTimeLimitSeconds,
+        RoomMoveTimeLimits,
+        DefaultRoomMoveTimeLimitSeconds);
 
     public static string? NormalizeRoomTimeControl(string? value)
     {
@@ -80,6 +94,37 @@ public static class GameOptionsCatalog
 
         return normalized;
     }
+
+    public static long? NormalizeRoomMoveTimeLimit(
+        string? normalizedTimeControl,
+        int? moveTimeLimitSeconds)
+    {
+        if (normalizedTimeControl is null)
+        {
+            if (moveTimeLimitSeconds is not null)
+            {
+                throw ApiException.Unprocessable(
+                    "MOVE_TIME_LIMIT_REQUIRES_CLOCK",
+                    "A move time limit requires a timed room.");
+            }
+
+            return null;
+        }
+
+        if (moveTimeLimitSeconds is null)
+        {
+            return null;
+        }
+
+        if (RoomMoveTimeLimits.All(option => option.Seconds != moveTimeLimitSeconds.Value))
+        {
+            throw ApiException.Unprocessable(
+                "UNSUPPORTED_MOVE_TIME_LIMIT",
+                "The requested move time limit is not available.");
+        }
+
+        return moveTimeLimitSeconds.Value * 1000L;
+    }
 }
 
 
@@ -90,6 +135,7 @@ public sealed class GameFactory(IGameStateSerializer stateSerializer, TimeProvid
         Guid secondPlayerId,
         string ruleVersion,
         string? timeControl,
+        long? moveTimeLimitMilliseconds = null,
         bool isRated = false)
     {
         if (!StringComparer.Ordinal.Equals(ruleVersion, GameState.CurrentRuleVersion))
@@ -104,18 +150,38 @@ public sealed class GameFactory(IGameStateSerializer stateSerializer, TimeProvid
 
         var normalizedTimeControl = TimeControlSettings.Normalize(timeControl);
         var clock = TimeControlSettings.Parse(normalizedTimeControl);
-        if (isRated && normalizedTimeControl != GameOptionsCatalog.QuickMatchTimeControlId)
+        if (clock is null && moveTimeLimitMilliseconds is not null)
+        {
+            throw ApiException.Unprocessable(
+                "MOVE_TIME_LIMIT_REQUIRES_CLOCK",
+                "A move time limit requires a timed game.");
+        }
+
+        if (moveTimeLimitMilliseconds is <= 0 or > 3_600_000)
+        {
+            throw ApiException.Unprocessable(
+                "INVALID_MOVE_TIME_LIMIT",
+                "A move time limit must be between 1 and 3600 seconds.");
+        }
+
+        if (isRated &&
+            (normalizedTimeControl != GameOptionsCatalog.QuickMatchTimeControlId ||
+             moveTimeLimitMilliseconds != GameOptionsCatalog.QuickMatchMoveTimeLimitMilliseconds))
         {
             throw ApiException.Unprocessable(
                 "INVALID_RATED_TIME_CONTROL",
-                "Rated games must use the quick-match time control.");
+                "Rated games must use the quick-match time control and move time limit.");
         }
+
         var firstIsRed = RandomNumberGenerator.GetInt32(2) == 0;
         var redPlayerId = firstIsRed ? firstPlayerId : secondPlayerId;
         var blackPlayerId = firstIsRed ? secondPlayerId : firstPlayerId;
         var now = timeProvider.GetUtcNow();
         var state = GameState.CreateInitial();
         var stateJson = stateSerializer.Serialize(state);
+        long? initialExpiryMilliseconds = clock is null
+            ? null
+            : Math.Min(clock.InitialMilliseconds, moveTimeLimitMilliseconds ?? long.MaxValue);
         var game = new GameEntity
         {
             Id = Guid.NewGuid(),
@@ -127,11 +193,15 @@ public sealed class GameFactory(IGameStateSerializer stateSerializer, TimeProvid
             Status = GameStatus.Playing,
             RuleVersion = ruleVersion,
             TimeControl = normalizedTimeControl,
+            MoveTimeLimitMilliseconds = moveTimeLimitMilliseconds,
+            TurnMilliseconds = moveTimeLimitMilliseconds,
             IsRated = isRated,
             RedMilliseconds = clock?.InitialMilliseconds,
             BlackMilliseconds = clock?.InitialMilliseconds,
             TurnStartedAt = clock is null ? null : now,
-            ClockExpiresAt = clock is null ? null : now.AddMilliseconds(clock.InitialMilliseconds),
+            ClockExpiresAt = initialExpiryMilliseconds is null
+                ? null
+                : now.AddMilliseconds(initialExpiryMilliseconds.Value),
             Version = 0,
             CreatedAt = now,
             UpdatedAt = now

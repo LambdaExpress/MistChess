@@ -132,6 +132,7 @@ public sealed class MatchmakingService(
                     PlayerId = playerId,
                     RuleVersion = request.RuleVersion,
                     TimeControl = timeControl,
+                    MoveTimeLimitMilliseconds = GameOptionsCatalog.QuickMatchMoveTimeLimitMilliseconds,
                     RatingSnapshot = rating.Rating,
                     Status = DbTicketStatus.Searching,
                     CreatedAt = now,
@@ -308,7 +309,8 @@ public sealed class MatchmakingService(
         ticket.CreatedAt,
         ticket.LastHeartbeatAt,
         ticket.ExpiresAt,
-        ticket.GameId);
+        ticket.GameId,
+        checked((int?)(ticket.MoveTimeLimitMilliseconds / 1000)));
 }
 
 internal static class MatchmakingConcurrency
@@ -447,6 +449,7 @@ public sealed class MatchmakingCoordinator(
                 FROM matchmaking_tickets AS ticket
                 WHERE ticket.status = 'Searching'
                   AND ticket.time_control = {GameOptionsCatalog.QuickMatchTimeControlId}
+                  AND ticket.move_time_limit_milliseconds = {GameOptionsCatalog.QuickMatchMoveTimeLimitMilliseconds}
                   AND ticket.expires_at > {now}
                   AND NOT EXISTS (
                       SELECT 1
@@ -474,6 +477,7 @@ public sealed class MatchmakingCoordinator(
                 ticket.Status == DbTicketStatus.Searching &&
                 ticket.RuleVersion == anchor.RuleVersion &&
                 ticket.TimeControl == GameOptionsCatalog.QuickMatchTimeControlId &&
+                ticket.MoveTimeLimitMilliseconds == GameOptionsCatalog.QuickMatchMoveTimeLimitMilliseconds &&
                 ticket.ExpiresAt > now &&
                 !db.GamePlayers.Any(participant =>
                     participant.PlayerId == ticket.PlayerId &&
@@ -498,6 +502,7 @@ public sealed class MatchmakingCoordinator(
                       AND ticket.player_id <> {anchor.PlayerId}
                       AND ticket.rule_version = {anchor.RuleVersion}
                       AND ticket.time_control = {GameOptionsCatalog.QuickMatchTimeControlId}
+                      AND ticket.move_time_limit_milliseconds = {GameOptionsCatalog.QuickMatchMoveTimeLimitMilliseconds}
                       AND ticket.expires_at > {now}
                       AND ABS(ticket.rating_snapshot - {anchor.RatingSnapshot}) <= {radius}
                       AND NOT EXISTS (
@@ -523,6 +528,7 @@ public sealed class MatchmakingCoordinator(
                       AND ticket.player_id <> {anchor.PlayerId}
                       AND ticket.rule_version = {anchor.RuleVersion}
                       AND ticket.time_control = {GameOptionsCatalog.QuickMatchTimeControlId}
+                      AND ticket.move_time_limit_milliseconds = {GameOptionsCatalog.QuickMatchMoveTimeLimitMilliseconds}
                       AND ticket.expires_at > {now}
                       AND NOT EXISTS (
                           SELECT 1
@@ -580,7 +586,8 @@ public sealed class MatchmakingCoordinator(
                 ticket.Status != DbTicketStatus.Searching ||
                 ticket.ExpiresAt <= now ||
                 ticket.RuleVersion != anchor.RuleVersion ||
-                ticket.TimeControl != GameOptionsCatalog.QuickMatchTimeControlId) ||
+                ticket.TimeControl != GameOptionsCatalog.QuickMatchTimeControlId ||
+                ticket.MoveTimeLimitMilliseconds != GameOptionsCatalog.QuickMatchMoveTimeLimitMilliseconds) ||
             await db.GamePlayers.AnyAsync(
                 value => playerIds.Contains(value.PlayerId) && value.IsActive,
                 cancellationToken);
@@ -607,6 +614,7 @@ public sealed class MatchmakingCoordinator(
             candidate.PlayerId,
             anchor.RuleVersion,
             GameOptionsCatalog.QuickMatchTimeControlId,
+            GameOptionsCatalog.QuickMatchMoveTimeLimitMilliseconds,
             isRated: true);
         db.Games.Add(game);
         foreach (var ticket in pair)

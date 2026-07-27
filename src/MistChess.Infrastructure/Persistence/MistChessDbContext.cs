@@ -56,6 +56,8 @@ public sealed class MistChessDbContext(DbContextOptions<MistChessDbContext> opti
         {
             table.HasCheckConstraint("ck_rooms_status", "status IN ('WaitingForOpponent', 'WaitingForReady', 'Playing', 'Finished')");
             table.HasCheckConstraint("ck_rooms_game", "(status IN ('Playing', 'Finished') AND game_id IS NOT NULL) OR (status IN ('WaitingForOpponent', 'WaitingForReady') AND game_id IS NULL)");
+            table.HasCheckConstraint("ck_rooms_move_time_limit", "(time_control IS NOT NULL) OR move_time_limit_milliseconds IS NULL");
+            table.HasCheckConstraint("ck_rooms_move_time_limit_positive", "move_time_limit_milliseconds IS NULL OR move_time_limit_milliseconds > 0");
         });
         entity.HasKey(value => value.Id);
         entity.Property(value => value.Id).HasColumnName("id");
@@ -64,6 +66,7 @@ public sealed class MistChessDbContext(DbContextOptions<MistChessDbContext> opti
         entity.Property(value => value.Status).HasColumnName("status").HasConversion<string>().HasMaxLength(32);
         entity.Property(value => value.RuleVersion).HasColumnName("rule_version").HasMaxLength(64).IsRequired();
         entity.Property(value => value.TimeControl).HasColumnName("time_control").HasMaxLength(64);
+        entity.Property(value => value.MoveTimeLimitMilliseconds).HasColumnName("move_time_limit_milliseconds");
         entity.Property(value => value.CreatedAt).HasColumnName("created_at");
         entity.Property(value => value.UpdatedAt).HasColumnName("updated_at");
         entity.Property(value => value.GameId).HasColumnName("game_id");
@@ -99,13 +102,15 @@ public sealed class MistChessDbContext(DbContextOptions<MistChessDbContext> opti
             table.HasCheckConstraint("ck_matchmaking_tickets_status", "status IN ('Searching', 'Matched', 'Cancelled', 'Expired')");
             table.HasCheckConstraint("ck_matchmaking_tickets_game", "(status = 'Matched' AND game_id IS NOT NULL) OR (status <> 'Matched' AND game_id IS NULL)");
             table.HasCheckConstraint("ck_matchmaking_tickets_rating_snapshot", "rating_snapshot >= 100");
-            table.HasCheckConstraint("ck_matchmaking_tickets_time_control", "status <> 'Searching' OR time_control = '600+5'");
+            table.HasCheckConstraint("ck_matchmaking_tickets_time_control", "status <> 'Searching' OR (time_control = '600+5' AND move_time_limit_milliseconds = 90000)");
+            table.HasCheckConstraint("ck_matchmaking_tickets_move_time_limit", "move_time_limit_milliseconds IS NULL OR move_time_limit_milliseconds > 0");
         });
         entity.HasKey(value => value.Id);
         entity.Property(value => value.Id).HasColumnName("id");
         entity.Property(value => value.PlayerId).HasColumnName("player_id");
         entity.Property(value => value.RuleVersion).HasColumnName("rule_version").HasMaxLength(64).IsRequired();
         entity.Property(value => value.TimeControl).HasColumnName("time_control").HasMaxLength(64);
+        entity.Property(value => value.MoveTimeLimitMilliseconds).HasColumnName("move_time_limit_milliseconds");
         entity.Property(value => value.RatingSnapshot).HasColumnName("rating_snapshot");
         entity.Property(value => value.Status).HasColumnName("status").HasConversion<string>().HasMaxLength(16);
         entity.Property(value => value.CreatedAt).HasColumnName("created_at");
@@ -130,8 +135,8 @@ public sealed class MistChessDbContext(DbContextOptions<MistChessDbContext> opti
             table.HasCheckConstraint("ck_games_distinct_players", "red_player_id <> black_player_id");
             table.HasCheckConstraint("ck_games_status", "status IN ('Playing', 'Finished')");
             table.HasCheckConstraint("ck_games_result", "(status = 'Finished' AND result_reason IS NOT NULL AND finished_at IS NOT NULL) OR (status = 'Playing' AND result_reason IS NULL AND winner IS NULL AND finished_at IS NULL)");
-            table.HasCheckConstraint("ck_games_clock", "(time_control IS NULL AND red_milliseconds IS NULL AND black_milliseconds IS NULL AND turn_started_at IS NULL) OR (time_control IS NOT NULL AND red_milliseconds >= 0 AND black_milliseconds >= 0)");
-            table.HasCheckConstraint("ck_games_rated_time_control", "NOT is_rated OR time_control = '600+5'");
+            table.HasCheckConstraint("ck_games_clock", "(time_control IS NULL AND red_milliseconds IS NULL AND black_milliseconds IS NULL AND turn_started_at IS NULL AND move_time_limit_milliseconds IS NULL AND turn_milliseconds IS NULL) OR (time_control IS NOT NULL AND red_milliseconds >= 0 AND black_milliseconds >= 0 AND ((move_time_limit_milliseconds IS NULL AND turn_milliseconds IS NULL) OR (move_time_limit_milliseconds > 0 AND turn_milliseconds BETWEEN 0 AND move_time_limit_milliseconds)))");
+            table.HasCheckConstraint("ck_games_rated_time_control", "NOT is_rated OR (time_control = '600+5' AND move_time_limit_milliseconds = 90000)");
             table.HasCheckConstraint("ck_games_clock_expiry", "(time_control IS NULL AND clock_expires_at IS NULL) OR (time_control IS NOT NULL AND ((status = 'Playing' AND clock_expires_at IS NOT NULL) OR (status = 'Finished' AND clock_expires_at IS NULL)))");
         });
         entity.HasKey(value => value.Id);
@@ -146,6 +151,8 @@ public sealed class MistChessDbContext(DbContextOptions<MistChessDbContext> opti
         entity.Property(value => value.ResultReason).HasColumnName("result_reason").HasMaxLength(32);
         entity.Property(value => value.RuleVersion).HasColumnName("rule_version").HasMaxLength(64).IsRequired();
         entity.Property(value => value.TimeControl).HasColumnName("time_control").HasMaxLength(64);
+        entity.Property(value => value.MoveTimeLimitMilliseconds).HasColumnName("move_time_limit_milliseconds");
+        entity.Property(value => value.TurnMilliseconds).HasColumnName("turn_milliseconds");
         entity.Property(value => value.IsRated).HasColumnName("is_rated");
         entity.Property(value => value.RedMilliseconds).HasColumnName("red_milliseconds");
         entity.Property(value => value.BlackMilliseconds).HasColumnName("black_milliseconds");
@@ -218,6 +225,7 @@ public sealed class MistChessDbContext(DbContextOptions<MistChessDbContext> opti
         entity.Property(value => value.RedMillisecondsAfter).HasColumnName("red_milliseconds_after");
         entity.Property(value => value.BlackMillisecondsAfter).HasColumnName("black_milliseconds_after");
         entity.Property(value => value.TurnStartedAtAfter).HasColumnName("turn_started_at_after");
+        entity.Property(value => value.TurnMillisecondsAfter).HasColumnName("turn_milliseconds_after");
         entity.Property(value => value.CreatedAt).HasColumnName("created_at");
         entity.HasIndex(value => new { value.GameId, value.Ply }).IsUnique().HasDatabaseName("ux_moves_game_ply");
         entity.HasIndex(value => new { value.GameId, value.ClientMoveId }).IsUnique().HasDatabaseName("ux_moves_game_client_move");
@@ -240,6 +248,7 @@ public sealed class MistChessDbContext(DbContextOptions<MistChessDbContext> opti
         entity.Property(value => value.RedMillisecondsAfter).HasColumnName("red_milliseconds_after");
         entity.Property(value => value.BlackMillisecondsAfter).HasColumnName("black_milliseconds_after");
         entity.Property(value => value.TurnStartedAtAfter).HasColumnName("turn_started_at_after");
+        entity.Property(value => value.TurnMillisecondsAfter).HasColumnName("turn_milliseconds_after");
         entity.Property(value => value.CreatedAt).HasColumnName("created_at");
         entity.HasIndex(value => new { value.GameId, value.PlayerId, value.ClientMoveId })
             .IsUnique()

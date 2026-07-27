@@ -183,6 +183,56 @@ public sealed class PostgresApiWorkflowTests(PostgresDatabaseFixture database) :
     }
 
     [Fact]
+    public async Task Timed_room_enforces_per_move_limit_without_zeroing_total_clock()
+    {
+        using var first = await CreatePlayerAsync();
+        using var second = await CreatePlayerAsync();
+        var room = await PostAsync<RoomView>(
+            first,
+            "/api/rooms",
+            new CreateRoomRequest(GameState.CurrentRuleVersion, "600+5", 90));
+        room.MoveTimeLimitSeconds.Should().Be(90);
+        await PostAsync<RoomView>(second, $"/api/rooms/{room.Code}/join", body: null);
+        await PostAsync<RoomView>(first, $"/api/rooms/{room.Code}/ready", new SetReadyRequest(true));
+        var started = await PostAsync<RoomView>(
+            second,
+            $"/api/rooms/{room.Code}/ready",
+            new SetReadyRequest(true));
+        var gameId = started.GameId!.Value;
+        var before = await GetAsync<ApiGameView>(first, $"/api/games/{gameId:D}");
+        before.MoveTimeLimitSeconds.Should().Be(90);
+        before.Clock!.TurnMilliseconds.Should().BeInRange(89_000, 90_000);
+        var timedOutSide = before.SideToMove;
+
+        await using (var connection = new NpgsqlConnection(database.ConnectionString))
+        {
+            await connection.OpenAsync();
+            await using var command = new NpgsqlCommand(
+                """
+                UPDATE games
+                SET turn_started_at = now() - interval '90 seconds',
+                    turn_milliseconds = 90000,
+                    clock_expires_at = now() - interval '1 millisecond'
+                WHERE id = @id
+                """,
+                connection);
+            command.Parameters.AddWithValue("id", gameId);
+            (await command.ExecuteNonQueryAsync()).Should().Be(1);
+        }
+
+        var finished = await PostAsync<ApiGameView>(first, $"/api/games/{gameId:D}/resign", body: null);
+        finished.Status.Should().Be(GameStatus.Finished);
+        finished.Result.Should().Be(new GameResultView(
+            timedOutSide == Side.Red ? Side.Black : Side.Red,
+            GameResultReason.Timeout));
+        finished.Clock!.TurnMilliseconds.Should().Be(0);
+        var totalRemaining = timedOutSide == Side.Red
+            ? finished.Clock.RedMilliseconds
+            : finished.Clock.BlackMilliseconds;
+        totalRemaining.Should().BeInRange(509_000, 510_000);
+    }
+
+    [Fact]
     public async Task Accepting_draw_after_current_clock_expires_finishes_by_timeout()
     {
         using var first = await CreatePlayerAsync();
@@ -562,6 +612,7 @@ public sealed class PostgresApiWorkflowTests(PostgresDatabaseFixture database) :
         var secondTicket = await PostAsync<MatchTicketView>(second, "/api/matchmaking/tickets", Ticket("second"));
         secondTicket.Status.Should().Be(MatchTicketStatus.Matched);
         secondTicket.TimeControl.Should().Be("600+5");
+        secondTicket.MoveTimeLimitSeconds.Should().Be(90);
         var firstCurrent = await GetAsync<MatchTicketView>(first, "/api/matchmaking/tickets/current");
         firstCurrent.Status.Should().Be(MatchTicketStatus.Matched);
         firstCurrent.GameId.Should().Be(secondTicket.GameId);
@@ -608,10 +659,11 @@ public sealed class PostgresApiWorkflowTests(PostgresDatabaseFixture database) :
                 await using var command = new NpgsqlCommand(
                     """
                     INSERT INTO matchmaking_tickets
-                        (id, player_id, rule_version, time_control, rating_snapshot, status,
-                         created_at, last_heartbeat_at, expires_at, client_request_id, concurrency_stamp)
+                        (id, player_id, rule_version, time_control, move_time_limit_milliseconds,
+                         rating_snapshot, status, created_at, last_heartbeat_at, expires_at,
+                         client_request_id, concurrency_stamp)
                     VALUES
-                        (@id, @player_id, @rule_version, '600+5', @rating, 'Searching',
+                        (@id, @player_id, @rule_version, '600+5', 90000, @rating, 'Searching',
                          @created_at, @now, @expires_at, @request_id, 0)
                     """,
                     connection);
@@ -648,6 +700,35 @@ public sealed class PostgresApiWorkflowTests(PostgresDatabaseFixture database) :
     }
 
     [Fact]
+    public async Task Guest_session_reports_the_active_game_until_it_finishes()
+    {
+        using var first = await CreatePlayerAsync();
+        using var second = await CreatePlayerAsync();
+        await PostAsync<MatchTicketView>(
+            first,
+            "/api/matchmaking/tickets",
+            Ticket("active-session-first"));
+        var matched = await PostAsync<MatchTicketView>(
+            second,
+            "/api/matchmaking/tickets",
+            Ticket("active-session-second"));
+        var gameId = matched.GameId!.Value;
+
+        var activeSession = await PostAsync<GuestSessionView>(
+            first,
+            "/api/sessions/guest",
+            body: null);
+        activeSession.ActiveGameId.Should().Be(gameId);
+
+        await PostAsync<ApiGameView>(first, $"/api/games/{gameId:D}/resign", body: null);
+        var finishedSession = await PostAsync<GuestSessionView>(
+            first,
+            "/api/sessions/guest",
+            body: null);
+        finishedSession.ActiveGameId.Should().BeNull();
+    }
+
+    [Fact]
     public async Task Rated_quick_match_snapshots_ratings_and_settles_once()
     {
         using var first = await CreatePlayerAsync();
@@ -667,24 +748,18 @@ public sealed class PostgresApiWorkflowTests(PostgresDatabaseFixture database) :
         var opponent = await GetAsync<ApiGameView>(second, $"/api/games/{gameId:D}");
 
         finished.TimeControl.Should().Be("600+5");
-        finished.RatingChange.Should().Be(new RatingChangeView(1500, 1480, -20));
-        opponent.RatingChange.Should().Be(new RatingChangeView(1500, 1520, 20));
+        finished.MoveTimeLimitSeconds.Should().Be(90);
         repeated.Version.Should().Be(finished.Version);
         repeated.Result.Should().Be(finished.Result);
-        repeated.RatingChange.Should().Be(finished.RatingChange);
 
         var firstSession = await PostAsync<GuestSessionView>(first, "/api/sessions/guest", body: null);
         var secondSession = await PostAsync<GuestSessionView>(second, "/api/sessions/guest", body: null);
-        firstSession.Rating.Should().Be(new PlayerRatingView(
-            GameState.CurrentRuleVersion,
-            "600+5",
-            1480,
-            1));
-        secondSession.Rating.Should().Be(new PlayerRatingView(
-            GameState.CurrentRuleVersion,
-            "600+5",
-            1520,
-            1));
+        var history = await GetAsync<HistoricalGamesPageView>(first, "/api/games/history?limit=10");
+        JsonSerializer.Serialize(finished, JsonOptions).Should().NotContain("rating");
+        JsonSerializer.Serialize(opponent, JsonOptions).Should().NotContain("rating");
+        JsonSerializer.Serialize(firstSession, JsonOptions).Should().NotContain("rating");
+        JsonSerializer.Serialize(secondSession, JsonOptions).Should().NotContain("rating");
+        JsonSerializer.Serialize(history, JsonOptions).Should().NotContain("rating");
 
         await using var connection = new NpgsqlConnection(database.ConnectionString);
         await connection.OpenAsync();
@@ -693,17 +768,24 @@ public sealed class PostgresApiWorkflowTests(PostgresDatabaseFixture database) :
             SELECT
                 (SELECT rating_snapshot FROM matchmaking_tickets WHERE id = @first_ticket),
                 (SELECT rating_snapshot FROM matchmaking_tickets WHERE id = @second_ticket),
+                (SELECT rating FROM player_ratings WHERE player_id = @first_player AND rule_version = @rule_version AND time_control = '600+5'),
+                (SELECT rating FROM player_ratings WHERE player_id = @second_player AND rule_version = @rule_version AND time_control = '600+5'),
                 (SELECT count(*) FROM rating_settlements WHERE game_id = @game_id)
             """,
             connection);
         command.Parameters.AddWithValue("first_ticket", firstTicket.TicketId);
         command.Parameters.AddWithValue("second_ticket", secondTicket.TicketId);
         command.Parameters.AddWithValue("game_id", gameId);
+        command.Parameters.AddWithValue("first_player", firstSession.PlayerId);
+        command.Parameters.AddWithValue("second_player", secondSession.PlayerId);
+        command.Parameters.AddWithValue("rule_version", GameState.CurrentRuleVersion);
         await using var reader = await command.ExecuteReaderAsync();
         (await reader.ReadAsync()).Should().BeTrue();
         reader.GetInt32(0).Should().Be(1500);
         reader.GetInt32(1).Should().Be(1500);
-        reader.GetInt64(2).Should().Be(1);
+        reader.GetInt32(2).Should().Be(1480);
+        reader.GetInt32(3).Should().Be(1520);
+        reader.GetInt64(4).Should().Be(1);
     }
 
     [Fact]

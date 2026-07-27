@@ -33,7 +33,6 @@ public sealed class GameService(
     {
         var game = await db.Games
             .AsNoTracking()
-            .Include(value => value.RatingSettlement)
             .SingleOrDefaultAsync(
                 value => value.Id == gameId && (value.RedPlayerId == playerId || value.BlackPlayerId == playerId),
                 cancellationToken)
@@ -177,6 +176,7 @@ public sealed class GameService(
         else
         {
             AddIncrement(game, side);
+            game.TurnMilliseconds = game.MoveTimeLimitMilliseconds;
             game.TurnStartedAt = game.TimeControl is null ? null : now;
             UpdateClockExpiry(game, now);
             game.Version++;
@@ -205,6 +205,7 @@ public sealed class GameService(
             RedMillisecondsAfter = game.RedMilliseconds,
             BlackMillisecondsAfter = game.BlackMilliseconds,
             TurnStartedAtAfter = game.TurnStartedAt,
+            TurnMillisecondsAfter = game.TurnMilliseconds,
             CreatedAt = now
         };
         db.Moves.Add(move);
@@ -525,6 +526,7 @@ public sealed class GameService(
             RedMillisecondsAfter = game.RedMilliseconds,
             BlackMillisecondsAfter = game.BlackMilliseconds,
             TurnStartedAtAfter = game.TurnStartedAt,
+            TurnMillisecondsAfter = game.TurnMilliseconds,
             CreatedAt = createdAt
         };
 
@@ -546,7 +548,6 @@ public sealed class GameService(
             .ToListAsync(cancellationToken);
         var game = lockedGames.SingleOrDefault() ?? throw ApiException.NotFound();
         await db.Entry(game).Collection(value => value.Players).LoadAsync(cancellationToken);
-        await db.Entry(game).Reference(value => value.RatingSettlement).LoadAsync(cancellationToken);
         return game;
     }
 
@@ -619,7 +620,7 @@ public sealed class GameService(
         await notifier.GameUpdatedAsync(game.Id, true, applicationLifetime.ApplicationStopping);
     }
 
-    private static long ApplyElapsedClock(GameEntity game, DateTimeOffset now)
+    internal static long ApplyElapsedClock(GameEntity game, DateTimeOffset now)
     {
         if (game.TimeControl is null || game.TurnStartedAt is not { } turnStartedAt)
         {
@@ -636,12 +637,19 @@ public sealed class GameService(
             game.BlackMilliseconds = Math.Max(0, game.BlackMilliseconds!.Value - elapsed);
         }
 
+        if (game.TurnMilliseconds is { } turnMilliseconds)
+        {
+            game.TurnMilliseconds = Math.Max(0, turnMilliseconds - elapsed);
+        }
+
         return elapsed;
     }
 
-    private static bool HasTimedOut(GameEntity game, Side side) => side == Side.Red
-        ? game.RedMilliseconds == 0
-        : game.BlackMilliseconds == 0;
+    internal static bool HasTimedOut(GameEntity game, Side side) =>
+        game.TurnMilliseconds == 0 ||
+        (side == Side.Red
+            ? game.RedMilliseconds == 0
+            : game.BlackMilliseconds == 0);
 
     private static void AddIncrement(GameEntity game, Side side)
     {
@@ -669,10 +677,15 @@ public sealed class GameService(
             return;
         }
 
-        var remaining = game.SideToMove == Side.Red
+        var totalRemaining = game.SideToMove == Side.Red
             ? game.RedMilliseconds
             : game.BlackMilliseconds;
-        game.ClockExpiresAt = remaining is null ? null : now.AddMilliseconds(remaining.Value);
+        long? expiryMilliseconds = totalRemaining is null
+            ? null
+            : Math.Min(totalRemaining.Value, game.TurnMilliseconds ?? long.MaxValue);
+        game.ClockExpiresAt = expiryMilliseconds is null
+            ? null
+            : now.AddMilliseconds(expiryMilliseconds.Value);
     }
 
     private static DomainPosition ToDomain(ApiPosition position) => new(position.File, position.Rank);
@@ -750,13 +763,11 @@ public sealed class GameClockWorker(
         {
             await db.Entry(game).Collection(value => value.Players).LoadAsync(cancellationToken);
             var timedOutSide = game.SideToMove;
-            if (timedOutSide == Side.Red)
+            GameService.ApplyElapsedClock(game, expiredAtByGame[game.Id]);
+            if (!GameService.HasTimedOut(game, timedOutSide))
             {
-                game.RedMilliseconds = 0;
-            }
-            else
-            {
-                game.BlackMilliseconds = 0;
+                throw new InvalidDataException(
+                    $"Game {game.Id} reached its persisted clock expiry without an exhausted clock.");
             }
 
             var room = await db.Rooms.SingleOrDefaultAsync(
@@ -875,19 +886,14 @@ public sealed class HistoryService(
                 game.FinishedAt!.Value,
                 game.RuleVersion,
                 game.TimeControl,
+                game.MoveTimeLimitMilliseconds,
                 game.RedPlayerId,
                 game.BlackPlayerId,
                 game.RedPlayer.DisplayName,
                 game.BlackPlayer.DisplayName,
                 game.Winner,
                 game.ResultReason!,
-                game.Moves.Count,
-                game.RatingSettlement == null
-                    ? null
-                    : game.RatingSettlement.RedRatingBefore,
-                game.RatingSettlement == null
-                    ? null
-                    : game.RatingSettlement.BlackRatingBefore))
+                game.Moves.Count))
             .Take(limit + 1)
             .ToListAsync(cancellationToken);
         var hasMore = rows.Count > limit;
@@ -1076,7 +1082,6 @@ public sealed class HistoryService(
         .AsNoTracking()
         .Include(value => value.RedPlayer)
         .Include(value => value.BlackPlayer)
-        .Include(value => value.RatingSettlement)
         .Include(value => value.Moves.OrderBy(move => move.Ply));
 
     private HistoricalReplayView BuildReplay(GameEntity game, Side? currentPlayerSide)
@@ -1093,7 +1098,8 @@ public sealed class HistoryService(
                 : new ClockView(
                     settings.InitialMilliseconds,
                     settings.InitialMilliseconds,
-                    game.CreatedAt),
+                    game.CreatedAt,
+                    game.MoveTimeLimitMilliseconds),
             null));
 
         foreach (var move in orderedMoves)
@@ -1108,7 +1114,7 @@ public sealed class HistoryService(
                 move.CapturedPieceType);
             var clock = move.RedMillisecondsAfter is { } red &&
                 move.BlackMillisecondsAfter is { } black
-                ? new ClockView(red, black, move.CreatedAt)
+                ? new ClockView(red, black, move.CreatedAt, move.TurnMillisecondsAfter)
                 : null;
             frames.Add(BuildFrame(state, move.Ply, clock, replayMove));
         }
@@ -1119,7 +1125,7 @@ public sealed class HistoryService(
             var finalState = stateSerializer.Deserialize(game.StateJson);
             var finalClock = game.RedMilliseconds is { } red &&
                 game.BlackMilliseconds is { } black
-                ? new ClockView(red, black, game.FinishedAt!.Value)
+                ? new ClockView(red, black, game.FinishedAt!.Value, game.TurnMilliseconds)
                 : null;
             frames.Add(BuildFrame(finalState, finalState.HalfMoveCount, finalClock, null));
         }
@@ -1132,7 +1138,8 @@ public sealed class HistoryService(
             ToHistoricalPlayer(game, Side.Red),
             ToHistoricalPlayer(game, Side.Black),
             GameViewProjector.MapResult(game),
-            frames);
+            frames,
+            ToSeconds(game.MoveTimeLimitMilliseconds));
     }
 
     private HistoricalReplayFrameView BuildFrame(
@@ -1164,16 +1171,15 @@ public sealed class HistoryService(
             currentSide,
             new HistoricalPlayerView(
                 row.RedDisplayName,
-                OutcomeFor(Side.Red, row.Winner),
-                row.RedRatingBefore),
+                OutcomeFor(Side.Red, row.Winner)),
             new HistoricalPlayerView(
                 row.BlackDisplayName,
-                OutcomeFor(Side.Black, row.Winner),
-                row.BlackRatingBefore),
+                OutcomeFor(Side.Black, row.Winner)),
             new GameResultView(
                 row.Winner,
                 Enum.Parse<GameResultReason>(row.ResultReason, ignoreCase: true)),
-            row.PlyCount);
+            row.PlyCount,
+            ToSeconds(row.MoveTimeLimitMilliseconds));
     }
 
     private static HistoricalPlayerView ToHistoricalPlayer(GameEntity game, Side side)
@@ -1181,12 +1187,7 @@ public sealed class HistoryService(
         var displayName = side == Side.Red
             ? game.RedPlayer.DisplayName
             : game.BlackPlayer.DisplayName;
-        int? ratingBefore = game.RatingSettlement is null
-            ? null
-            : side == Side.Red
-                ? game.RatingSettlement.RedRatingBefore
-                : game.RatingSettlement.BlackRatingBefore;
-        return new HistoricalPlayerView(displayName, OutcomeFor(side, game.Winner), ratingBefore);
+        return new HistoricalPlayerView(displayName, OutcomeFor(side, game.Winner));
     }
 
     private static HistoricalOutcome OutcomeFor(Side side, Side? winner) => winner switch
@@ -1262,6 +1263,9 @@ public sealed class HistoryService(
     private static string HashToken(string token) =>
         Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(token))).ToLowerInvariant();
 
+    private static int? ToSeconds(long? milliseconds) =>
+        milliseconds is null ? null : checked((int)(milliseconds.Value / 1000));
+
     private sealed record HistoryCursor(DateTimeOffset FinishedAt, Guid GameId);
 
     private sealed record HistoryRow(
@@ -1269,13 +1273,12 @@ public sealed class HistoryService(
         DateTimeOffset FinishedAt,
         string RuleVersion,
         string? TimeControl,
+        long? MoveTimeLimitMilliseconds,
         Guid RedPlayerId,
         Guid BlackPlayerId,
         string RedDisplayName,
         string BlackDisplayName,
         Side? Winner,
         string ResultReason,
-        int PlyCount,
-        int? RedRatingBefore,
-        int? BlackRatingBefore);
+        int PlyCount);
 }

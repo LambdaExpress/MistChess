@@ -21,6 +21,9 @@ public sealed class RoomService(
     {
         ValidateRuleVersion(request.RuleVersion);
         var timeControl = GameOptionsCatalog.NormalizeRoomTimeControl(request.TimeControl);
+        var moveTimeLimit = GameOptionsCatalog.NormalizeRoomMoveTimeLimit(
+            timeControl,
+            request.MoveTimeLimitSeconds);
         await EnsurePlayerCanStartGameAsync(playerId, cancellationToken);
         var now = timeProvider.GetUtcNow();
         var room = new RoomEntity
@@ -31,6 +34,7 @@ public sealed class RoomService(
             Status = GameStatus.WaitingForOpponent,
             RuleVersion = request.RuleVersion,
             TimeControl = timeControl,
+            MoveTimeLimitMilliseconds = moveTimeLimit,
             CreatedAt = now,
             UpdatedAt = now
         };
@@ -183,7 +187,8 @@ public sealed class RoomService(
                 room.Players[0].PlayerId,
                 room.Players[1].PlayerId,
                 room.RuleVersion,
-                room.TimeControl);
+                room.TimeControl,
+                room.MoveTimeLimitMilliseconds);
             db.Games.Add(game);
             foreach (var participant in room.Players)
             {
@@ -240,7 +245,11 @@ public sealed class RoomService(
                 value.IsReady,
                 value.PlayerId == currentPlayerId))
             .ToArray(),
-        room.GameId);
+        room.GameId,
+        ToSeconds(room.MoveTimeLimitMilliseconds));
+
+    private static int? ToSeconds(long? milliseconds) =>
+        milliseconds is null ? null : checked((int)(milliseconds.Value / 1000));
 
     private static string NormalizeCode(string code)
     {

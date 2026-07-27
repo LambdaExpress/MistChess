@@ -36,6 +36,7 @@ public sealed class RoomEntity
     public GameStatus Status { get; set; }
     public required string RuleVersion { get; set; }
     public string? TimeControl { get; set; }
+    public long? MoveTimeLimitMilliseconds { get; set; }
     public DateTimeOffset CreatedAt { get; set; }
     public DateTimeOffset UpdatedAt { get; set; }
     public Guid? GameId { get; set; }
@@ -62,6 +63,7 @@ public sealed class MatchmakingTicketEntity
     public GuestSessionEntity Player { get; set; } = null!;
     public required string RuleVersion { get; set; }
     public string? TimeControl { get; set; }
+    public long? MoveTimeLimitMilliseconds { get; set; }
     public int RatingSnapshot { get; set; }
     public MatchTicketStatus Status { get; set; }
     public DateTimeOffset CreatedAt { get; set; }
@@ -88,6 +90,8 @@ public sealed class GameEntity
     public string? ResultReason { get; set; }
     public required string RuleVersion { get; set; }
     public string? TimeControl { get; set; }
+    public long? MoveTimeLimitMilliseconds { get; set; }
+    public long? TurnMilliseconds { get; set; }
     public bool IsRated { get; set; }
     public long? RedMilliseconds { get; set; }
     public long? BlackMilliseconds { get; set; }
@@ -138,6 +142,7 @@ public sealed class MoveEntity
     public long? RedMillisecondsAfter { get; set; }
     public long? BlackMillisecondsAfter { get; set; }
     public DateTimeOffset? TurnStartedAtAfter { get; set; }
+    public long? TurnMillisecondsAfter { get; set; }
     public DateTimeOffset CreatedAt { get; set; }
 }
 
@@ -156,6 +161,7 @@ public sealed class MoveCommandReceiptEntity
     public long? RedMillisecondsAfter { get; set; }
     public long? BlackMillisecondsAfter { get; set; }
     public DateTimeOffset? TurnStartedAtAfter { get; set; }
+    public long? TurnMillisecondsAfter { get; set; }
     public DateTimeOffset CreatedAt { get; set; }
 }
 

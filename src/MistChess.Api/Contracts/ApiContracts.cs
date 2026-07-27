@@ -31,16 +31,11 @@ public enum GameResultReason
     NoProgress
 }
 
-public sealed record PlayerRatingView(
-    string RuleVersion,
-    string TimeControl,
-    int Rating,
-    int GamesPlayed);
 
 public sealed record GuestSessionView(
     Guid PlayerId,
     string DisplayName,
-    PlayerRatingView Rating);
+    Guid? ActiveGameId);
 
 public sealed record AntiforgeryTokenView(string Token, string HeaderName);
 public sealed record TimeControlOptionView(
@@ -48,13 +43,18 @@ public sealed record TimeControlOptionView(
     string Label,
     int InitialSeconds,
     int IncrementSeconds);
+public sealed record MoveTimeLimitOptionView(int Seconds, string Label);
+
 
 public sealed record GameOptionsView(
     string RuleVersion,
     TimeControlOptionView QuickMatchTimeControl,
     IReadOnlyList<TimeControlOptionView> RoomTimeControls,
     string DefaultRoomTimeControlId,
-    bool AllowUntimedRooms);
+    bool AllowUntimedRooms,
+    int QuickMatchMoveTimeLimitSeconds,
+    IReadOnlyList<MoveTimeLimitOptionView> RoomMoveTimeLimits,
+    int DefaultRoomMoveTimeLimitSeconds);
 
 public sealed record RoomPlayerView(string DisplayName, Side? Side, bool IsReady, bool IsCurrentPlayer);
 
@@ -64,11 +64,13 @@ public sealed record RoomView(
     string RuleVersion,
     string? TimeControl,
     IReadOnlyList<RoomPlayerView> Players,
-    Guid? GameId);
+    Guid? GameId,
+    int? MoveTimeLimitSeconds = null);
 
 public sealed record CreateRoomRequest(
     [Required, MaxLength(64)][property: JsonRequired] string RuleVersion,
-    [MaxLength(64)][property: JsonRequired] string? TimeControl);
+    [MaxLength(64)][property: JsonRequired] string? TimeControl,
+    int? MoveTimeLimitSeconds = null);
 
 public sealed record SetReadyRequest([property: JsonRequired] bool Ready);
 
@@ -84,7 +86,8 @@ public sealed record MatchTicketView(
     DateTimeOffset CreatedAt,
     DateTimeOffset LastHeartbeatAt,
     DateTimeOffset ExpiresAt,
-    Guid? GameId);
+    Guid? GameId,
+    int? MoveTimeLimitSeconds = null);
 
 public sealed record MatchFoundView(Guid TicketId, Guid GameId, Side Perspective);
 
@@ -100,10 +103,13 @@ public sealed record CaptureSummaryView(
     IReadOnlyList<PieceType> RedLost,
     IReadOnlyList<PieceType> BlackLost);
 
-public sealed record ClockView(long RedMilliseconds, long BlackMilliseconds, DateTimeOffset ServerTime);
+public sealed record ClockView(
+    long RedMilliseconds,
+    long BlackMilliseconds,
+    DateTimeOffset ServerTime,
+    long? TurnMilliseconds = null);
 
 public sealed record GameResultView(Side? Winner, GameResultReason Reason);
-public sealed record RatingChangeView(int Before, int After, int Delta);
 
 public sealed record GameView(
     Guid GameId,
@@ -120,7 +126,7 @@ public sealed record GameView(
     CaptureSummaryView CaptureSummary,
     ClockView? Clock,
     DrawOfferView? DrawOffer,
-    RatingChangeView? RatingChange);
+    int? MoveTimeLimitSeconds = null);
 
 public sealed record MoveRequest(
     [Required][property: JsonRequired] Position From,
@@ -147,8 +153,7 @@ public enum HistoricalOutcome
 
 public sealed record HistoricalPlayerView(
     string DisplayName,
-    HistoricalOutcome Outcome,
-    int? RatingBefore);
+    HistoricalOutcome Outcome);
 
 public sealed record HistoricalGameSummaryView(
     Guid GameId,
@@ -159,7 +164,8 @@ public sealed record HistoricalGameSummaryView(
     HistoricalPlayerView Red,
     HistoricalPlayerView Black,
     GameResultView Result,
-    int PlyCount);
+    int PlyCount,
+    int? MoveTimeLimitSeconds = null);
 
 public sealed record HistoricalGamesPageView(
     IReadOnlyList<HistoricalGameSummaryView> Games,
@@ -190,7 +196,8 @@ public sealed record HistoricalReplayView(
     HistoricalPlayerView Red,
     HistoricalPlayerView Black,
     GameResultView Result,
-    IReadOnlyList<HistoricalReplayFrameView> Frames);
+    IReadOnlyList<HistoricalReplayFrameView> Frames,
+    int? MoveTimeLimitSeconds = null);
 
 public sealed record ReplayShareCreatedView(
     string SharePath,
