@@ -660,10 +660,23 @@ test('private room is created, joined, and started through page controls', async
   const [creator, joiner] = players
 
   try {
+    const moveTimeLimit = creator.page.getByLabel('单步上限')
+    await expect(moveTimeLimit).toHaveValue('90')
+    await moveTimeLimit.selectOption('60')
+    const createRequestPromise = creator.page.waitForRequest((request) =>
+      new URL(request.url()).pathname === '/api/rooms' && request.method() === 'POST')
     const createResponsePromise = waitForResponse(creator.page, '/api/rooms')
     await creator.page.getByRole('button', { name: '创建房间' }).click()
-    const createResponse = await createResponsePromise
+    const [createRequest, createResponse] = await Promise.all([
+      createRequestPromise,
+      createResponsePromise,
+    ])
+    expect(createRequest.postDataJSON()).toMatchObject({
+      timeControl: '180+2',
+      moveTimeLimitSeconds: 60,
+    })
     expect(createResponse.ok()).toBeTruthy()
+    expect((await createResponse.json()).moveTimeLimitSeconds).toBe(60)
     await expect(creator.page).toHaveURL(/\/room\/[^/]+$/)
     await expect(creator.page.getByRole('heading', { name: '好友对局房间' })).toBeVisible()
 
