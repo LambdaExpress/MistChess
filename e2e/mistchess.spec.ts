@@ -61,6 +61,30 @@ function browserContextOptions(testInfo: TestInfo, playerIndex: number): Browser
   }
 }
 
+async function installAudioProbe(context: BrowserContext): Promise<void> {
+  await context.addInitScript(() => {
+    const sounds: string[] = []
+    ;(window as Window & { __mistChessSounds?: string[] }).__mistChessSounds = sounds
+    Object.defineProperty(HTMLMediaElement.prototype, 'play', {
+      configurable: true,
+      value(this: HTMLMediaElement) {
+        const soundEvent = this.dataset.soundEvent
+        if (soundEvent && this.volume > 0) sounds.push(soundEvent)
+        return Promise.resolve()
+      },
+    })
+    Object.defineProperty(HTMLMediaElement.prototype, 'pause', {
+      configurable: true,
+      value() {},
+    })
+  })
+}
+
+async function playedSounds(page: Page): Promise<string[]> {
+  return page.evaluate(() =>
+    (window as Window & { __mistChessSounds?: string[] }).__mistChessSounds ?? [])
+}
+
 function waitForResponse(page: Page, path: string, method = 'POST'): Promise<APIResponse> {
   return page.waitForResponse((response) =>
     new URL(response.url()).pathname === path && response.request().method() === method)
@@ -91,6 +115,10 @@ async function openTwoPlayers(
   const [contextA, contextB] = await Promise.all([
     browser.newContext(browserContextOptions(testInfo, 0)),
     browser.newContext(browserContextOptions(testInfo, 1)),
+  ])
+  await Promise.all([
+    installAudioProbe(contextA),
+    installAudioProbe(contextB),
   ])
   return Promise.all([
     openPlayerAtHome(contextA),
@@ -277,6 +305,20 @@ async function currentGame(player: PlayerClient, gameId: string): Promise<GameVi
   return response.json() as Promise<GameView>
 }
 
+function assertCurrentViewEquivalent(wire: GameView | undefined, http: GameView): void {
+  expect(wire).toBeDefined()
+  const realtime = wire!
+  expect({ ...realtime, clock: null }).toEqual({ ...http, clock: null })
+  if (realtime.clock && http.clock) {
+    expect(Math.abs(realtime.clock.redMilliseconds - http.clock.redMilliseconds)).toBeLessThan(1_000)
+    expect(Math.abs(realtime.clock.blackMilliseconds - http.clock.blackMilliseconds)).toBeLessThan(1_000)
+    expect(Math.abs(Date.parse(realtime.clock.serverTime) - Date.parse(http.clock.serverTime)))
+      .toBeLessThan(1_000)
+  } else {
+    expect(realtime.clock).toBe(http.clock)
+  }
+}
+
 async function expectResponsivePage(page: Page, testInfo: TestInfo): Promise<void> {
   if (testInfo.project.name !== 'mobile-chromium') return
   const dimensions = await page.evaluate(() => ({
@@ -290,22 +332,27 @@ async function expectResponsivePage(page: Page, testInfo: TestInfo): Promise<voi
 }
 
 async function verifyReplayPage(page: Page, testInfo: TestInfo): Promise<void> {
-  await expect(page).toHaveURL(/\/game\/[^/]+\/replay$/)
-  await expect(page.getByRole('heading', { name: '完整棋局回放' })).toBeVisible()
+  await expect(page).toHaveURL(/\/history\/[^/]+$/)
+  await expect(page.getByRole('heading', { name: '迷雾棋局回放' })).toBeVisible()
   const board = page.getByTestId('game-board')
   await expect(board).toBeVisible()
-  await expect(board.locator('svg.game-board__svg')).toHaveAttribute('aria-label', /完整回放，第 0 个半回合/)
-  await expect(board.locator('[data-testid^="fog-"]')).toHaveCount(0)
-
-  const slider = page.getByRole('slider', { name: '回放进度' })
-  await expect(slider).toBeVisible()
-  const finalPly = await slider.getAttribute('max')
-  expect(Number(finalPly)).toBeGreaterThan(0)
-  await page.getByRole('button', { name: '跳到终局' }).click()
-  await expect(slider).toHaveValue(finalPly as string)
   await expect(board.locator('svg.game-board__svg')).toHaveAttribute(
     'aria-label',
-    new RegExp(`完整回放，第 ${finalPly} 个半回合`),
+    /(红方|黑方)视野，第 0 个半回合/,
+  )
+  expect(await board.locator('[data-testid^="fog-"]').count()).toBeGreaterThan(0)
+
+  await page.getByRole('button', { name: '全局视野' }).click()
+  await expect(board.locator('[data-testid^="fog-"]')).toHaveCount(0)
+  const slider = page.getByRole('slider', { name: '回放进度' })
+  await expect(slider).toBeVisible()
+  const finalFrame = await slider.getAttribute('max')
+  expect(Number(finalFrame)).toBeGreaterThan(0)
+  await page.getByRole('button', { name: '跳到终局' }).click()
+  await expect(slider).toHaveValue(finalFrame as string)
+  await expect(board.locator('svg.game-board__svg')).toHaveAttribute(
+    'aria-label',
+    /全局视野，第 \d+ 个半回合/,
   )
   await expect(page.getByText('初始局面')).toHaveCount(0)
   await expectResponsivePage(page, testInfo)
@@ -327,6 +374,18 @@ test('quick match completes through the UI with isolated realtime views and reco
     await playerA.page.getByRole('button', { name: '寻找对手' }).click()
     const firstTicketResponse = await firstTicketResponsePromise
     expect(firstTicketResponse.ok()).toBeTruthy()
+    const firstTicket = await firstTicketResponse.json() as Record<string, unknown>
+    expect(firstTicket.timeControl).toBe('600+5')
+    const firstTicketProtocol = JSON.stringify(firstTicket)
+    for (const internalField of [
+      'eligiblePopulation',
+      'populationBand',
+      'waitingBonus',
+      'effectiveRadius',
+      'ratingSnapshot',
+    ]) {
+      expect(firstTicketProtocol).not.toContain(internalField)
+    }
     await expect(playerA.page).toHaveURL(/\/match$/)
 
     const lobbySocket = await lobbySocketPromise
@@ -336,6 +395,7 @@ test('quick match completes through the UI with isolated realtime views and reco
     await expect(lobbyConnection).toHaveAttribute('data-state', 'connected')
     await expect(lobbyConnection).toContainText('大厅已连接')
     await expectResponsivePage(playerA.page, testInfo)
+    await expect(playerA.page.getByText('正在为你匹配对手…')).toBeVisible()
 
     const gameSocketAPromise = waitForHubSocket(playerA.page, '/hubs/game')
     const gameSocketBPromise = waitForHubSocket(playerB.page, '/hubs/game')
@@ -381,10 +441,21 @@ test('quick match completes through the UI with isolated realtime views and reco
     ])
     expect(initialVersionA).toBe(initialVersionB)
 
-    const playerATurn = await playerA.page.getByText('你的回合', { exact: true }).isVisible()
-    const playerBTurn = await playerB.page.getByText('你的回合', { exact: true }).isVisible()
+    const playerATurn = await playerA.page.getByRole('heading', { name: '轮到你行棋' }).isVisible()
+    const playerBTurn = await playerB.page.getByRole('heading', { name: '轮到你行棋' }).isVisible()
     expect(Number(playerATurn) + Number(playerBTurn)).toBe(1)
     const mover = playerATurn ? playerA : playerB
+    const mutedPlayer = playerATurn ? playerB : playerA
+    const moverBefore = await currentGame(mover, gameId)
+    expect(moverBefore.clock).not.toBeNull()
+    await expect.poll(() => playedSounds(mover.page)).toContain('game-start')
+    await expect.poll(() => playedSounds(mutedPlayer.page)).toContain('game-start')
+    const mutedSoundsBeforeMove = (await playedSounds(mutedPlayer.page)).length
+    const muteButton = mutedPlayer.page.getByRole('button', { name: '音效开启' })
+    await expect(muteButton).toHaveAttribute('aria-pressed', 'true')
+    await muteButton.click()
+    await expect(mutedPlayer.page.getByRole('button', { name: '音效静音' }))
+      .toHaveAttribute('aria-pressed', 'false')
     await submitFirstBoardMove(mover.page, gameId)
 
     await Promise.all([
@@ -398,6 +469,21 @@ test('quick match completes through the UI with isolated realtime views and reco
       domGameVersion(playerB.page),
     ])
     expect(movedVersionA).toBe(movedVersionB)
+    const moverAfter = await currentGame(mover, gameId)
+    expect(moverAfter.clock).not.toBeNull()
+    const beforeMoverMilliseconds = moverBefore.sideToMove === 'red'
+      ? moverBefore.clock!.redMilliseconds
+      : moverBefore.clock!.blackMilliseconds
+    const afterMoverMilliseconds = moverBefore.sideToMove === 'red'
+      ? moverAfter.clock!.redMilliseconds
+      : moverAfter.clock!.blackMilliseconds
+    expect(afterMoverMilliseconds - beforeMoverMilliseconds).toBeGreaterThan(2_500)
+    expect(afterMoverMilliseconds - beforeMoverMilliseconds).toBeLessThanOrEqual(5_000)
+    await expect.poll(() => playedSounds(mover.page)).toContain('move-self')
+    expect(await playedSounds(mutedPlayer.page)).toHaveLength(mutedSoundsBeforeMove)
+    await mutedPlayer.page.getByRole('button', { name: '音效静音' }).click()
+    await expect(mutedPlayer.page.getByRole('button', { name: '音效开启' }))
+      .toHaveAttribute('aria-pressed', 'true')
 
     const [viewA, viewB, fogA, fogB] = await Promise.all([
       currentGame(playerA, gameId),
@@ -407,8 +493,8 @@ test('quick match completes through the UI with isolated realtime views and reco
     ])
     const wireViewA = latestGameView(gameCaptureA)
     const wireViewB = latestGameView(gameCaptureB)
-    expect(wireViewA).toEqual(viewA)
-    expect(wireViewB).toEqual(viewB)
+    assertCurrentViewEquivalent(wireViewA, viewA)
+    assertCurrentViewEquivalent(wireViewB, viewB)
     expect(viewA.perspective).toBe(perspectiveA)
     expect(viewB.perspective).toBe(perspectiveB)
     expect(viewA.visibleSquares).not.toEqual(viewB.visibleSquares)
@@ -467,8 +553,50 @@ test('quick match completes through the UI with isolated realtime views and reco
       expect.poll(() => hubArguments<GameView>(gameCaptureB, ['GameEnded']).length)
         .toBeGreaterThan(0),
     ])
+    await expect.poll(() => playedSounds(playerA.page)).toContain('game-loss')
+    await expect.poll(() => playedSounds(playerB.page)).toContain('game-win')
+    const rematchResponsePromise = waitForResponse(
+      playerB.page,
+      '/api/matchmaking/tickets',
+    )
+    await playerB.page.getByRole('button', { name: '重新匹配' }).click()
+    const rematchResponse = await rematchResponsePromise
+    expect(rematchResponse.ok()).toBeTruthy()
+    const rematchTicket = await rematchResponse.json() as {
+      ticketId: string
+      timeControl: string
+    }
+    expect(rematchTicket.timeControl).toBe('600+5')
+    await expect(playerB.page).toHaveURL(/\/match$/)
+    await expect(playerB.page.getByText('正在为你匹配对手…')).toBeVisible()
+    const currentTicketResponse = await playerB.context.request.get(
+      '/api/matchmaking/tickets/current',
+    )
+    expect(currentTicketResponse.ok()).toBeTruthy()
+    const currentTicket = await currentTicketResponse.json() as { ticketId: string }
+    expect(currentTicket.ticketId).toBe(rematchTicket.ticketId)
+    const cancelResponsePromise = waitForResponse(
+      playerB.page,
+      `/api/matchmaking/tickets/${rematchTicket.ticketId}`,
+      'DELETE',
+    )
+    await playerB.page.getByRole('button', { name: '取消匹配' }).click()
+    expect((await cancelResponsePromise).ok()).toBeTruthy()
+    await playerB.page.goto(`${baseUrl}/game/${gameId}`)
+    await expect(playerB.page.getByRole('heading', { name: '棋局结束' })).toBeVisible()
     assertPlayerScopedProtocol([gameCaptureA, recoveredCaptureA], perspectiveA, gameId)
     assertPlayerScopedProtocol([gameCaptureB], perspectiveB, gameId)
+
+    const lobbyProtocol = lobbyCapture.rawFrames.join('\n')
+    for (const internalField of [
+      'eligiblePopulation',
+      'populationBand',
+      'waitingBonus',
+      'effectiveRadius',
+      'ratingSnapshot',
+    ]) {
+      expect(lobbyProtocol).not.toContain(internalField)
+    }
 
     await Promise.all([
       playerA.page.getByRole('link', { name: '查看完整回放' }).click(),
@@ -478,6 +606,50 @@ test('quick match completes through the UI with isolated realtime views and reco
       verifyReplayPage(playerA.page, testInfo),
       verifyReplayPage(playerB.page, testInfo),
     ])
+
+    const createShareResponsePromise = waitForResponse(
+      playerA.page,
+      `/api/games/${gameId}/replay-share`,
+    )
+    await playerA.page.getByRole('button', { name: '生成分享链接' }).click()
+    expect((await createShareResponsePromise).ok()).toBeTruthy()
+    const shareUrl = await playerA.page.getByRole('textbox', { name: '分享链接' }).inputValue()
+    expect(shareUrl).toMatch(/\/shared\/replay\/[A-Za-z0-9_-]{43}$/)
+
+    const sharedContext = await browser.newContext()
+    try {
+      const sharedPage = await sharedContext.newPage()
+      let guestSessionRequests = 0
+      sharedPage.on('request', (request) => {
+        if (new URL(request.url()).pathname === '/api/sessions/guest') {
+          guestSessionRequests += 1
+        }
+      })
+      await sharedPage.goto(shareUrl)
+      await expect(sharedPage.getByRole('heading', { name: '迷雾棋局回放' })).toBeVisible()
+      await expect(sharedPage.getByText(/通过分享链接观看。此链接只授予/)).toBeVisible()
+      expect(guestSessionRequests).toBe(0)
+      await expectResponsivePage(sharedPage, testInfo)
+
+      const revokeResponsePromise = waitForResponse(
+        playerA.page,
+        `/api/games/${gameId}/replay-share`,
+        'DELETE',
+      )
+      await playerA.page.getByRole('button', { name: '撤销当前分享' }).click()
+      expect((await revokeResponsePromise).status()).toBe(204)
+      await sharedPage.reload()
+      await expect(
+        sharedPage.getByRole('heading', { name: '分享链接无效或已撤销' }),
+      ).toBeVisible()
+    } finally {
+      await sharedContext.close()
+    }
+
+    await playerA.page.getByRole('link', { name: '返回历史列表' }).click()
+    await expect(playerA.page.getByRole('heading', { name: '我的历史对局' })).toBeVisible()
+    await expect(playerA.page.getByRole('link', { name: /查看回放/ }).first()).toBeVisible()
+    await expectResponsivePage(playerA.page, testInfo)
   } finally {
     await Promise.all(players.map((player) => player.context.close()))
   }
