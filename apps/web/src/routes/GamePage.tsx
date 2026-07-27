@@ -50,6 +50,7 @@ type ClockSnapshot = {
   version: number
   redMilliseconds: number
   blackMilliseconds: number
+  turnMilliseconds: number | null
   receivedAt: number
   sideToMove: Side
   playing: boolean
@@ -71,6 +72,7 @@ function useInterpolatedClock(view: GameView | undefined) {
       version: view.version,
       redMilliseconds: view.clock.redMilliseconds,
       blackMilliseconds: view.clock.blackMilliseconds,
+      turnMilliseconds: view.clock.turnMilliseconds ?? null,
       receivedAt,
       sideToMove: view.sideToMove,
       playing: view.status === 'playing',
@@ -85,7 +87,11 @@ function useInterpolatedClock(view: GameView | undefined) {
   }, [view?.clock, view?.status])
 
   const snapshot = snapshotRef.current
-  if (!snapshot) return view?.clock ?? null
+  if (!snapshot) {
+    return view?.clock
+      ? { ...view.clock, turnMilliseconds: view.clock.turnMilliseconds ?? null }
+      : null
+  }
   const remaining = interpolateClock(
     snapshot.redMilliseconds,
     snapshot.blackMilliseconds,
@@ -93,9 +99,13 @@ function useInterpolatedClock(view: GameView | undefined) {
     snapshot.playing,
     monotonicNow - snapshot.receivedAt,
   )
+  const elapsedMilliseconds = monotonicNow - snapshot.receivedAt
   return {
     ...remaining,
     serverTime: view?.clock?.serverTime ?? '',
+    turnMilliseconds: snapshot.turnMilliseconds === null || !snapshot.playing
+      ? snapshot.turnMilliseconds
+      : Math.max(0, snapshot.turnMilliseconds - elapsedMilliseconds),
   }
 }
 
@@ -224,9 +234,13 @@ export function GamePage() {
 
   useEffect(() => {
     if (!view || !interpolatedClock || view.status !== 'playing') return
-    const remaining = view.perspective === 'red'
+    const totalRemaining = view.perspective === 'red'
       ? interpolatedClock.redMilliseconds
       : interpolatedClock.blackMilliseconds
+    const remaining = view.sideToMove === view.perspective &&
+      interpolatedClock.turnMilliseconds !== null
+      ? Math.min(totalRemaining, interpolatedClock.turnMilliseconds)
+      : totalRemaining
     const previous = previousOwnRemaining.current
     if (previous !== null) {
       for (const threshold of [10_000, 5_000]) {
@@ -249,20 +263,13 @@ export function GamePage() {
   }, [interpolatedClock, view])
 
   useEffect(() => {
-    const ratingChange = view?.ratingChange
-    if (!ratingChange) return
+    if (!view) return
+    const activeGameId = view.status === 'playing' ? view.gameId : null
     queryClient.setQueryData<GuestSession>(queryKeys.session, (session) => {
-      if (!session || session.rating.rating === ratingChange.after) return session
-      return {
-        ...session,
-        rating: {
-          ...session.rating,
-          rating: ratingChange.after,
-          gamesPlayed: session.rating.gamesPlayed + 1,
-        },
-      }
+      if (!session || session.activeGameId === activeGameId) return session
+      return { ...session, activeGameId }
     })
-  }, [queryClient, view?.ratingChange])
+  }, [queryClient, view])
 
   const rematch = useMutation<MatchTicket, unknown, void>({
     mutationFn: async () => {
@@ -365,6 +372,16 @@ export function GamePage() {
   const incomingDrawOffer = drawOffer?.status === 'pending' && drawOffer.offeredBy !== view.perspective
   const isFinished = view.status === 'finished'
   const captured = view.captureSummary
+  const redEffectiveMilliseconds = view.sideToMove === 'red' &&
+    interpolatedClock?.turnMilliseconds !== null &&
+    interpolatedClock?.turnMilliseconds !== undefined
+    ? Math.min(interpolatedClock.redMilliseconds, interpolatedClock.turnMilliseconds)
+    : interpolatedClock?.redMilliseconds
+  const blackEffectiveMilliseconds = view.sideToMove === 'black' &&
+    interpolatedClock?.turnMilliseconds !== null &&
+    interpolatedClock?.turnMilliseconds !== undefined
+    ? Math.min(interpolatedClock.blackMilliseconds, interpolatedClock.turnMilliseconds)
+    : interpolatedClock?.blackMilliseconds
 
   return (
     <div className="game-page">
@@ -406,7 +423,7 @@ export function GamePage() {
               <div className={[
                 'clock-row',
                 view.sideToMove === 'black' ? 'clock-row--active' : '',
-                view.sideToMove === 'black' && interpolatedClock.blackMilliseconds < 10_000
+                view.sideToMove === 'black' && (blackEffectiveMilliseconds ?? 0) < 10_000
                   ? 'clock-row--low'
                   : '',
               ].filter(Boolean).join(' ')}>
@@ -414,7 +431,10 @@ export function GamePage() {
                 <div>
                   <small>黑方</small>
                   <strong>{formatClock(interpolatedClock.blackMilliseconds)}</strong>
-                  {view.sideToMove === 'black' && interpolatedClock.blackMilliseconds < 10_000
+                  {view.sideToMove === 'black' && interpolatedClock.turnMilliseconds !== null
+                    ? <span className="clock-turn">本步 {formatClock(interpolatedClock.turnMilliseconds)}</span>
+                    : null}
+                  {view.sideToMove === 'black' && (blackEffectiveMilliseconds ?? 0) < 10_000
                     ? <em>时间不足</em>
                     : null}
                 </div>
@@ -422,7 +442,7 @@ export function GamePage() {
               <div className={[
                 'clock-row',
                 view.sideToMove === 'red' ? 'clock-row--active' : '',
-                view.sideToMove === 'red' && interpolatedClock.redMilliseconds < 10_000
+                view.sideToMove === 'red' && (redEffectiveMilliseconds ?? 0) < 10_000
                   ? 'clock-row--low'
                   : '',
               ].filter(Boolean).join(' ')}>
@@ -430,7 +450,10 @@ export function GamePage() {
                 <div>
                   <small>红方</small>
                   <strong>{formatClock(interpolatedClock.redMilliseconds)}</strong>
-                  {view.sideToMove === 'red' && interpolatedClock.redMilliseconds < 10_000
+                  {view.sideToMove === 'red' && interpolatedClock.turnMilliseconds !== null
+                    ? <span className="clock-turn">本步 {formatClock(interpolatedClock.turnMilliseconds)}</span>
+                    : null}
+                  {view.sideToMove === 'red' && (redEffectiveMilliseconds ?? 0) < 10_000
                     ? <em>时间不足</em>
                     : null}
                 </div>
@@ -451,17 +474,6 @@ export function GamePage() {
               <p className="page-kicker">FINAL RESULT</p>
               <h2>{view.result.winner ? `${sideNames[view.result.winner]}获胜` : '本局和棋'}</h2>
               <p>{resultReasons[view.result.reason]}</p>
-              {view.ratingChange ? (
-                <div className="rating-change" aria-label="本局匹配分变化">
-                  <span>{view.ratingChange.before}</span>
-                  <span aria-hidden="true">→</span>
-                  <strong>{view.ratingChange.after}</strong>
-                  <em>
-                    {view.ratingChange.delta >= 0 ? '+' : ''}
-                    {view.ratingChange.delta}
-                  </em>
-                </div>
-              ) : null}
               <button
                 type="button"
                 className="button button--accent button--wide"

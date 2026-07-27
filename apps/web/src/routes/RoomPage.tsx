@@ -76,6 +76,11 @@ export function RoomPage() {
         <p className="page-kicker">PRIVATE ROOM</p>
         <h1>好友对局房间</h1>
         <p>{waitingForOpponent ? '把房间码发给好友，等待对方加入。' : '双方都准备后，对局将自动开始。'}</p>
+        <p>
+          {room.timeControl
+            ? `${room.timeControl} · ${room.moveTimeLimitSeconds ? `每步 ${room.moveTimeLimitSeconds} 秒` : '无单步上限'}`
+            : '无计时'}
+        </p>
       </section>
 
       <section className="room-code-card" aria-labelledby="room-code-title">

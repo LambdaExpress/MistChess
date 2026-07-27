@@ -4,8 +4,14 @@ import { MemoryRouter, Route, Routes } from 'react-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError, api } from '../api/client'
 import { queryKeys } from '../api/queryKeys'
-import type { GameOptions, MatchTicket } from '../api/types'
+import type { GameOptions, GuestSession, MatchTicket } from '../api/types'
 import { HomePage } from './HomePage'
+
+const session: GuestSession = {
+  playerId: 'player-1',
+  displayName: '游客甲',
+  activeGameId: null,
+}
 
 const ticket: MatchTicket = {
   ticketId: 'ticket-1',
@@ -36,6 +42,9 @@ const gameOptions: GameOptions = {
   ],
   defaultRoomTimeControlId: '180+2',
   allowUntimedRooms: true,
+  quickMatchMoveTimeLimitSeconds: 90,
+  roomMoveTimeLimits: [{ seconds: 90, label: '90 秒' }],
+  defaultRoomMoveTimeLimitSeconds: 90,
 }
 
 function renderHomePage() {
@@ -52,6 +61,8 @@ function renderHomePage() {
         <Routes>
           <Route path="/" element={<HomePage />} />
           <Route path="/match" element={<p>Matching</p>} />
+          <Route path="/game/:gameId" element={<p>Active game</p>} />
+          <Route path="/room/:code" element={<p>Private room</p>} />
         </Routes>
       </MemoryRouter>
     </QueryClientProvider>,
@@ -63,6 +74,7 @@ function renderHomePage() {
 beforeEach(() => {
   sessionStorage.clear()
   vi.spyOn(api, 'getGameOptions').mockResolvedValue(gameOptions)
+  vi.spyOn(api, 'startGuestSession').mockResolvedValue(session)
 })
 
 afterEach(() => {
@@ -123,4 +135,61 @@ describe('HomePage quick match recovery', () => {
     })
     expect(sessionStorage.length).toBe(0)
   })
+
+  it('shows a return action when the session has an active game', async () => {
+    vi.mocked(api.startGuestSession).mockResolvedValue({
+      ...session,
+      activeGameId: 'active-game-1',
+    })
+    const createMatchTicket = vi.spyOn(api, 'createMatchTicket')
+
+    renderHomePage()
+    const returnButton = await screen.findByRole('button', { name: '返回对局' })
+    fireEvent.click(returnButton)
+
+    expect(await screen.findByText('Active game')).toBeInTheDocument()
+    expect(createMatchTicket).not.toHaveBeenCalled()
+  })
+
+  it('resumes the unfinished game when ticket creation reports an active game', async () => {
+    vi.spyOn(api, 'createMatchTicket').mockRejectedValue(
+      new ApiError(409, {
+        code: 'ACTIVE_GAME_EXISTS',
+        title: 'The player already has an unfinished game.',
+        gameId: 'active-game-1',
+      }),
+    )
+
+    renderHomePage()
+    const matchButton = screen.getByRole('button', { name: '寻找对手' })
+    await waitFor(() => expect(matchButton).toBeEnabled())
+    fireEvent.click(matchButton)
+
+    expect(await screen.findByText('Active game')).toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+  it('creates a timed room with the selected per-move limit', async () => {
+    const createRoom = vi.spyOn(api, 'createRoom').mockResolvedValue({
+      code: 'ROOM1234',
+      status: 'waitingForOpponent',
+      ruleVersion: 'fog-xiangqi-v1',
+      timeControl: '180+2',
+      players: [],
+      gameId: null,
+      moveTimeLimitSeconds: 90,
+    })
+
+    renderHomePage()
+    const createButton = await screen.findByRole('button', { name: '创建房间' })
+    await waitFor(() => expect(createButton).toBeEnabled())
+    fireEvent.click(createButton)
+
+    await waitFor(() => {
+      expect(createRoom.mock.calls[0][0]).toEqual({
+        timeControl: '180+2',
+        moveTimeLimitSeconds: 90,
+      })
+    })
+  })
+
 })

@@ -504,29 +504,6 @@ p {
   text-align: center;
 }
 
-.rating-summary {
-  margin-top: 22px;
-  padding: 14px 16px;
-  display: grid;
-  grid-template-columns: 1fr auto;
-  gap: 4px 12px;
-  border: 1px solid rgba(232, 194, 118, 0.28);
-  background: rgba(255, 255, 255, 0.06);
-}
-
-.rating-summary span,
-.rating-summary small {
-  color: rgba(248, 241, 223, 0.72);
-}
-
-.rating-summary strong {
-  color: #f3cf88;
-  font-variant-numeric: tabular-nums;
-}
-
-.rating-summary small {
-  grid-column: 1 / -1;
-}
 
 .room-time-control {
   margin-top: 24px;
@@ -536,6 +513,10 @@ p {
   font-size: 12px;
   font-weight: 700;
 }
+.room-time-control + .room-time-control {
+  margin-top: 12px;
+}
+
 
 .room-time-control select {
   width: 100%;
@@ -1237,6 +1218,14 @@ p {
   color: var(--red);
 }
 
+.clock-turn {
+  display: block;
+  margin-top: 2px;
+  color: var(--ink-soft);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
 .clock-row em {
   display: block;
   margin-top: 2px;
@@ -1323,28 +1312,6 @@ p {
   color: var(--ink-soft);
 }
 
-.rating-change {
-  margin: 0 0 16px;
-  padding: 12px;
-  display: flex;
-  align-items: baseline;
-  justify-content: center;
-  gap: 9px;
-  border: 1px solid var(--line);
-  background: rgba(23, 75, 61, 0.045);
-  font-variant-numeric: tabular-nums;
-}
-
-.rating-change strong {
-  color: var(--jade);
-  font-size: 22px;
-}
-
-.rating-change em {
-  color: var(--red);
-  font-style: normal;
-  font-weight: 800;
-}
 
 .fog-note {
   border-left: 4px solid var(--jade);
@@ -1624,6 +1591,7 @@ p {
   margin-bottom: 16px;
   padding: 12px 18px;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 16px;
   border: 1px solid var(--line);

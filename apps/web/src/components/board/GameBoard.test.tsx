@@ -30,7 +30,6 @@ function createView(overrides: Partial<GameView> = {}): GameView {
     captureSummary: { redLost: [], blackLost: [] },
     clock: null,
     drawOffer: null,
-    ratingChange: null,
     ...overrides,
   }
 }

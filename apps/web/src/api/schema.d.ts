@@ -358,6 +358,8 @@ export interface components {
             blackMilliseconds: number;
             /** Format: date-time */
             serverTime: string;
+            /** Format: int64 */
+            turnMilliseconds?: null | number;
         };
         CreateMatchTicketRequest: {
             ruleVersion: string;
@@ -366,6 +368,8 @@ export interface components {
         CreateRoomRequest: {
             ruleVersion: string;
             timeControl: null | string;
+            /** Format: int32 */
+            moveTimeLimitSeconds?: null | number;
         };
         /** @enum {string} */
         DrawOfferStatus: "pending" | "accepted" | "rejected" | "withdrawn";
@@ -386,6 +390,11 @@ export interface components {
             roomTimeControls: components["schemas"]["TimeControlOptionView"][];
             defaultRoomTimeControlId: string;
             allowUntimedRooms: boolean;
+            /** Format: int32 */
+            quickMatchMoveTimeLimitSeconds: number;
+            roomMoveTimeLimits: components["schemas"]["MoveTimeLimitOptionView"][];
+            /** Format: int32 */
+            defaultRoomMoveTimeLimitSeconds: number;
         };
         /** @enum {string} */
         GameResultReason: "generalCaptured" | "noLegalMove" | "resignation" | "timeout" | "agreedDraw" | "repetition" | "noProgress";
@@ -412,13 +421,15 @@ export interface components {
             captureSummary: components["schemas"]["CaptureSummaryView"];
             clock: null | components["schemas"]["ClockView"];
             drawOffer: null | components["schemas"]["DrawOfferView"];
-            ratingChange: null | components["schemas"]["RatingChangeView"];
+            /** Format: int32 */
+            moveTimeLimitSeconds?: null | number;
         };
         GuestSessionView: {
             /** Format: uuid */
             playerId: string;
             displayName: string;
-            rating: components["schemas"]["PlayerRatingView"];
+            /** Format: uuid */
+            activeGameId: null | string;
         };
         HistoricalGamesPageView: {
             games: components["schemas"]["HistoricalGameSummaryView"][];
@@ -437,14 +448,14 @@ export interface components {
             result: components["schemas"]["GameResultView"];
             /** Format: int32 */
             plyCount: number;
+            /** Format: int32 */
+            moveTimeLimitSeconds?: null | number;
         };
         /** @enum {string} */
         HistoricalOutcome: "win" | "loss" | "draw";
         HistoricalPlayerView: {
             displayName: string;
             outcome: components["schemas"]["HistoricalOutcome"];
-            /** Format: int32 */
-            ratingBefore: null | number;
         };
         HistoricalReplayFrameView: {
             /** Format: int32 */
@@ -463,6 +474,8 @@ export interface components {
             black: components["schemas"]["HistoricalPlayerView"];
             result: components["schemas"]["GameResultView"];
             frames: components["schemas"]["HistoricalReplayFrameView"][];
+            /** Format: int32 */
+            moveTimeLimitSeconds?: null | number;
         };
         /** @enum {string} */
         MatchTicketStatus: "searching" | "matched" | "cancelled" | "expired";
@@ -480,6 +493,8 @@ export interface components {
             expiresAt: string;
             /** Format: uuid */
             gameId: null | string;
+            /** Format: int32 */
+            moveTimeLimitSeconds?: null | number;
         };
         MoveRequest: {
             from: components["schemas"]["Position"];
@@ -488,6 +503,11 @@ export interface components {
             expectedVersion: number;
             clientMoveId: string;
         };
+        MoveTimeLimitOptionView: {
+            /** Format: int32 */
+            seconds: number;
+            label: string;
+        };
         /** @enum {string} */
         PieceType: "general" | "advisor" | "elephant" | "horse" | "rook" | "cannon" | "pawn";
         PieceView: {
@@ -495,27 +515,11 @@ export interface components {
             type: components["schemas"]["PieceType"];
             position: components["schemas"]["Position"];
         };
-        PlayerRatingView: {
-            ruleVersion: string;
-            timeControl: string;
-            /** Format: int32 */
-            rating: number;
-            /** Format: int32 */
-            gamesPlayed: number;
-        };
         Position: {
             /** Format: int32 */
             file: number;
             /** Format: int32 */
             rank: number;
-        };
-        RatingChangeView: {
-            /** Format: int32 */
-            before: number;
-            /** Format: int32 */
-            after: number;
-            /** Format: int32 */
-            delta: number;
         };
         ReplayFrameProjectionView: {
             visibleSquares: components["schemas"]["Position"][];
@@ -556,6 +560,8 @@ export interface components {
             players: components["schemas"]["RoomPlayerView"][];
             /** Format: uuid */
             gameId: null | string;
+            /** Format: int32 */
+            moveTimeLimitSeconds?: null | number;
         };
         SetReadyRequest: {
             ready: boolean;

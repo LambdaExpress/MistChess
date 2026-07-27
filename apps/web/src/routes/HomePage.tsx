@@ -17,6 +17,7 @@ export function HomePage() {
   const queryClient = useQueryClient()
   const [roomCode, setRoomCode] = useState('')
   const [roomTimeControl, setRoomTimeControl] = useState('')
+  const [roomMoveTimeLimit, setRoomMoveTimeLimit] = useState('')
   const sessionQuery = useQuery<GuestSession>({
     queryKey: queryKeys.session,
     queryFn: api.startGuestSession,
@@ -52,6 +53,15 @@ export function HomePage() {
     mutationFn: api.createMatchTicket,
     onSuccess: enterMatch,
     onError: async (error) => {
+      if (
+        error instanceof ApiError &&
+        error.code === 'ACTIVE_GAME_EXISTS' &&
+        typeof error.problem.gameId === 'string'
+      ) {
+        void navigate(`/game/${encodeURIComponent(error.problem.gameId)}`)
+        return
+      }
+
       if (!(error instanceof ApiError) || error.code !== 'ACTIVE_TICKET_EXISTS') return
 
       try {
@@ -78,12 +88,22 @@ export function HomePage() {
   }
 
   const options = optionsQuery.data
+  const activeGameId = sessionQuery.data?.activeGameId
   const selectedRoomTimeControl = roomTimeControl ||
     options?.defaultRoomTimeControlId ||
     ''
-  const roomTimeControlRequest = selectedRoomTimeControl === 'untimed'
-    ? null
-    : selectedRoomTimeControl
+  const selectedRoomMoveTimeLimit = roomMoveTimeLimit ||
+    options?.defaultRoomMoveTimeLimitSeconds.toString() ||
+    'none'
+  const roomSettings = {
+    timeControl: selectedRoomTimeControl === 'untimed'
+      ? null
+      : selectedRoomTimeControl,
+    moveTimeLimitSeconds: selectedRoomTimeControl === 'untimed' ||
+      selectedRoomMoveTimeLimit === 'none'
+      ? null
+      : Number(selectedRoomMoveTimeLimit),
+  }
   const activeError = createRoom.error ?? joinRoom.error ?? startMatch.error
     ?? optionsQuery.error
   const busy = createRoom.isPending || joinRoom.isPending || startMatch.isPending
@@ -112,25 +132,32 @@ export function HomePage() {
           <div className="entry-card__number" aria-hidden="true">01</div>
           <p className="entry-card__kicker">QUICK MATCH</p>
           <h2>快速匹配</h2>
-          <p>固定 10 分钟基础时间，每次合法非终局走子增加 5 秒；系统优先安排实力接近的对手。</p>
-          <div className="rating-summary">
-            <span>当前匹配分</span>
-            <strong>
-              {sessionQuery.data?.rating.gamesPlayed
-                ? sessionQuery.data.rating.rating
-                : `暂定 ${sessionQuery.data?.rating.rating ?? 1500}`}
-            </strong>
-            <small>分数会随已完成的快速匹配对局调整</small>
-          </div>
+          <p>
+            固定 10 分钟基础时间，每次走子增加 5 秒，每步最多
+            {options?.quickMatchMoveTimeLimitSeconds ?? 90} 秒；系统优先安排实力接近的对手。
+          </p>
           <button
             type="button"
             className="button button--accent button--wide"
-            disabled={busy || !options}
-            onClick={startQuickMatch}
+            disabled={busy || !options || !sessionQuery.data}
+            onClick={() => {
+              if (activeGameId) {
+                void navigate(`/game/${encodeURIComponent(activeGameId)}`)
+              } else {
+                startQuickMatch()
+              }
+            }}
           >
-            {startMatch.isPending ? '正在入池…' : '寻找对手'}
+            {startMatch.isPending
+              ? '正在入池…'
+              : activeGameId
+                ? '返回对局'
+                : '寻找对手'}
           </button>
-          <small>{RULE_VERSION} · {options?.quickMatchTimeControl.label ?? '10 分钟 + 5 秒'}</small>
+          <small>
+            {RULE_VERSION} · {options?.quickMatchTimeControl.label ?? '10 分钟 + 5 秒'}
+            {' · '}每步 {options?.quickMatchMoveTimeLimitSeconds ?? 90} 秒
+          </small>
         </article>
 
         <article className="entry-card">
@@ -152,11 +179,25 @@ export function HomePage() {
               {options?.allowUntimedRooms ? <option value="untimed">无计时</option> : null}
             </select>
           </label>
+          <label className="room-time-control" htmlFor="room-move-time-limit">
+            <span>单步上限</span>
+            <select
+              id="room-move-time-limit"
+              value={selectedRoomMoveTimeLimit}
+              disabled={busy || !options || selectedRoomTimeControl === 'untimed'}
+              onChange={(event) => setRoomMoveTimeLimit(event.target.value)}
+            >
+              {options?.roomMoveTimeLimits.map((option) => (
+                <option key={option.seconds} value={option.seconds}>{option.label}</option>
+              ))}
+              <option value="none">不限制</option>
+            </select>
+          </label>
           <button
             type="button"
             className="button button--secondary button--wide"
             disabled={busy || !options}
-            onClick={() => createRoom.mutate(roomTimeControlRequest)}
+            onClick={() => createRoom.mutate(roomSettings)}
           >
             {createRoom.isPending ? '正在创建…' : '创建房间'}
           </button>

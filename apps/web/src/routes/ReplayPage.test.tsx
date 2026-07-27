@@ -10,7 +10,7 @@ import { ReplayPage } from './ReplayPage'
 const session: GuestSession = {
   playerId: 'player-1',
   displayName: '游客甲',
-  rating: { ruleVersion: 'fog-xiangqi-v1', timeControl: '600+5', rating: 1512, gamesPlayed: 3 },
+  activeGameId: null,
 }
 const allPositions = Array.from({ length: 90 }, (_, index) => ({
   file: index % 9,
@@ -47,8 +47,8 @@ function replay(currentPlayerSide: 'red' | 'black' | null): HistoricalReplay {
     ruleVersion: 'fog-xiangqi-v1',
     timeControl: '600+5',
     currentPlayerSide,
-    red: { displayName: '游客甲', outcome: 'win', ratingBefore: 1500 },
-    black: { displayName: '游客乙', outcome: 'loss', ratingBefore: 1500 },
+    red: { displayName: '游客甲', outcome: 'win' },
+    black: { displayName: '游客乙', outcome: 'loss' },
     result: { winner: 'red', reason: 'resignation' },
     frames: [
       {

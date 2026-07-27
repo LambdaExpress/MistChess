@@ -4,7 +4,13 @@ import { MemoryRouter, Route, Routes } from 'react-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError, api } from '../api/client'
 import { useGameHub } from '../api/hubs'
-import { QUICK_MATCH_CLIENT_REQUEST_ID_KEY, type GameView, type MatchTicket } from '../api/types'
+import { queryKeys } from '../api/queryKeys'
+import {
+  QUICK_MATCH_CLIENT_REQUEST_ID_KEY,
+  type GameView,
+  type GuestSession,
+  type MatchTicket,
+} from '../api/types'
 import { interpolateClock } from '../features/game/clock'
 import { audioService } from '../features/audio/audioService'
 import { GamePage } from './GamePage'
@@ -12,6 +18,12 @@ import { GamePage } from './GamePage'
 vi.mock('../api/hubs', () => ({
   useGameHub: vi.fn(() => 'connected'),
 }))
+const session: GuestSession = {
+  playerId: 'player-1',
+  displayName: '游客甲',
+  activeGameId: null,
+}
+
 
 function snapshot(overrides: Partial<GameView> = {}): GameView {
   return {
@@ -34,7 +46,6 @@ function snapshot(overrides: Partial<GameView> = {}): GameView {
     captureSummary: { redLost: [], blackLost: [] },
     clock: null,
     drawOffer: null,
-    ratingChange: null,
     ...overrides,
   }
 }
@@ -42,12 +53,13 @@ function snapshot(overrides: Partial<GameView> = {}): GameView {
 function renderGamePage() {
   const queryClient = new QueryClient({
     defaultOptions: {
-      queries: { retry: false, gcTime: 0 },
+      queries: { retry: false, gcTime: Infinity },
       mutations: { retry: false, gcTime: 0 },
     },
   })
+  queryClient.setQueryData(queryKeys.session, session)
 
-  return render(
+  const view = render(
     <QueryClientProvider client={queryClient}>
       <MemoryRouter initialEntries={['/game/game-1']}>
         <Routes>
@@ -57,6 +69,8 @@ function renderGamePage() {
       </MemoryRouter>
     </QueryClientProvider>,
   )
+
+  return { ...view, queryClient }
 }
 
 type GameHubHandlers = Parameters<typeof useGameHub>[0]
@@ -77,6 +91,31 @@ afterEach(() => {
 })
 
 describe('GamePage recovery and commands', () => {
+  it('keeps the session active game in sync with the loaded game state', async () => {
+    vi.spyOn(api, 'getGame').mockResolvedValue(snapshot())
+
+    const { queryClient } = renderGamePage()
+    await screen.findByRole('heading', { name: '轮到你行棋' })
+    await waitFor(() => {
+      expect(queryClient.getQueryData<GuestSession>(queryKeys.session)?.activeGameId)
+        .toBe('game-1')
+    })
+
+    act(() => {
+      gameHubHandlers?.onView(snapshot({
+        version: 9,
+        status: 'finished',
+        result: { winner: 'black', reason: 'resignation' },
+        candidateMoves: [],
+      }))
+    })
+
+    await waitFor(() => {
+      expect(queryClient.getQueryData<GuestSession>(queryKeys.session)?.activeGameId)
+        .toBeNull()
+    })
+  })
+
   it('recovers a missed equal-version draw offer through the HTTP refetch callback', async () => {
     const current = snapshot()
     const recovered = snapshot({
@@ -173,6 +212,24 @@ describe('GamePage recovery and commands', () => {
     expect(emit.mock.calls.filter((call) => call[2] === 'clock-low')).toHaveLength(1)
   })
 
+  it('shows the current turn budget separately from the total clock', async () => {
+    vi.spyOn(api, 'getGame').mockResolvedValue(snapshot({
+      timeControl: '600+5',
+      moveTimeLimitSeconds: 90,
+      clock: {
+        redMilliseconds: 600_000,
+        blackMilliseconds: 600_000,
+        serverTime: '2026-07-27T00:00:00Z',
+        turnMilliseconds: 90_000,
+      },
+    }))
+
+    renderGamePage()
+
+    expect(await screen.findByText('本步 01:30')).toBeInTheDocument()
+    expect(screen.getAllByText('10:00')).toHaveLength(2)
+  })
+
   it('allows only one game command until the in-flight command settles', async () => {
     const current = snapshot()
     const {
@@ -215,7 +272,6 @@ describe('GamePage recovery and commands', () => {
       status: 'finished',
       result: { winner: 'black', reason: 'resignation' },
       candidateMoves: [],
-      ratingChange: { before: 1500, after: 1480, delta: -20 },
     })
     const ticket: MatchTicket = {
       ticketId: 'ticket-rematch',

@@ -9,7 +9,7 @@ import { HistoryPage } from './HistoryPage'
 const session: GuestSession = {
   playerId: 'player-1',
   displayName: '游客甲',
-  rating: { ruleVersion: 'fog-xiangqi-v1', timeControl: '600+5', rating: 1512, gamesPlayed: 3 },
+  activeGameId: null,
 }
 
 const options: GameOptions = {
@@ -25,6 +25,9 @@ const options: GameOptions = {
   ],
   defaultRoomTimeControlId: '600+5',
   allowUntimedRooms: true,
+  quickMatchMoveTimeLimitSeconds: 90,
+  roomMoveTimeLimits: [{ seconds: 90, label: '90 秒' }],
+  defaultRoomMoveTimeLimitSeconds: 90,
 }
 
 function game(gameId: string, currentPlayerSide: 'red' | 'black'): HistoricalGame {
@@ -34,8 +37,8 @@ function game(gameId: string, currentPlayerSide: 'red' | 'black'): HistoricalGam
     ruleVersion: 'fog-xiangqi-v1',
     timeControl: '600+5',
     currentPlayerSide,
-    red: { displayName: '游客甲', outcome: 'win', ratingBefore: 1500 },
-    black: { displayName: '游客乙', outcome: 'loss', ratingBefore: 1500 },
+    red: { displayName: '游客甲', outcome: 'win' },
+    black: { displayName: '游客乙', outcome: 'loss' },
     result: { winner: 'red', reason: 'resignation' },
     plyCount: 12,
   }

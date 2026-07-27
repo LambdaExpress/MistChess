@@ -161,7 +161,6 @@ export function ReplayPage({ shared = false }: { shared?: boolean }) {
     captureSummary: projection.captureSummary,
     clock: frame.clock,
     drawOffer: null,
-    ratingChange: null,
   }
   const move = projection.move
   const shareUrl = sharePath ? new URL(sharePath, window.location.origin).toString() : ''
@@ -200,6 +199,11 @@ export function ReplayPage({ shared = false }: { shared?: boolean }) {
           <em data-outcome={replay.black.outcome}>{outcomeNames[replay.black.outcome]}</em>
         </div>
         <p>{reasonNames[replay.result.reason]}</p>
+        <p>
+          {replay.timeControl
+            ? `${replay.timeControl}${replay.moveTimeLimitSeconds ? ` · 每步 ${replay.moveTimeLimitSeconds} 秒` : ''}`
+            : '无计时'}
+        </p>
       </section>
 
       <div className="replay-mode-switch" role="group" aria-label="回放视野">

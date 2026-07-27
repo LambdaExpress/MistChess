@@ -141,7 +141,11 @@ export function HistoryPage() {
                 </div>
                 <div>
                   <dt>计时</dt>
-                  <dd>{game.timeControl ? timeControlLabel.get(game.timeControl) ?? game.timeControl : '无计时'}</dd>
+                  <dd>
+                    {game.timeControl
+                      ? `${timeControlLabel.get(game.timeControl) ?? game.timeControl}${game.moveTimeLimitSeconds ? ` · 每步 ${game.moveTimeLimitSeconds} 秒` : ''}`
+                      : '无计时'}
+                  </dd>
                 </div>
                 <div>
                   <dt>结束原因</dt>

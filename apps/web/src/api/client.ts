@@ -113,12 +113,15 @@ export const api = {
     return requestJson<'getGameHistory'>(`/api/games/history${query}`)
   },
 
-  createRoom: (timeControl: string | null) =>
+  createRoom: (settings: {
+    timeControl: string | null
+    moveTimeLimitSeconds: number | null
+  }) =>
     requestJson<'createRoom'>('/api/rooms', {
       method: 'POST',
       body: jsonBody<JsonRequest<'createRoom'>>({
         ruleVersion: RULE_VERSION,
-        timeControl,
+        ...settings,
       }),
     }),
 

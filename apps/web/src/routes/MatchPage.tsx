@@ -152,6 +152,7 @@ export function MatchPage() {
         <dl>
           <div><dt>规则版本</dt><dd>{ticket.ruleVersion}</dd></div>
           <div><dt>计时配置</dt><dd>{ticket.timeControl ?? '无计时'}</dd></div>
+          <div><dt>单步上限</dt><dd>{ticket.moveTimeLimitSeconds ? `${ticket.moveTimeLimitSeconds} 秒` : '不限制'}</dd></div>
           <div><dt>票据状态</dt><dd>{ticket.status}</dd></div>
           <div><dt>票据编号</dt><dd className="mono">{ticket.ticketId.slice(-8)}</dd></div>
         </dl>

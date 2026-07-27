@@ -21,7 +21,6 @@ function snapshot(version: number): GameView {
     captureSummary: { redLost: [], blackLost: [] },
     clock: null,
     drawOffer: null,
-    ratingChange: null,
   }
 }
 
