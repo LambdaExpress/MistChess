@@ -1,6 +1,11 @@
+using System.Diagnostics;
+using System.Globalization;
+using System.Security.Cryptography;
+using System.Text;
 using System.Data;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Storage;
+using Microsoft.AspNetCore.WebUtilities;
 using MistChess.Api.Contracts;
 using MistChess.Domain;
 using MistChess.Infrastructure.Persistence;
@@ -18,6 +23,7 @@ public sealed class GameService(
     IDbContextFactory<MistChessDbContext> contextFactory,
     IGameStateSerializer stateSerializer,
     GameViewProjector projector,
+    GameCompletionService completion,
     IGameNotifier notifier,
     TimeProvider timeProvider,
     IHostApplicationLifetime applicationLifetime,
@@ -27,6 +33,7 @@ public sealed class GameService(
     {
         var game = await db.Games
             .AsNoTracking()
+            .Include(value => value.RatingSettlement)
             .SingleOrDefaultAsync(
                 value => value.Id == gameId && (value.RedPlayerId == playerId || value.BlackPlayerId == playerId),
                 cancellationToken)
@@ -171,6 +178,7 @@ public sealed class GameService(
         {
             AddIncrement(game, side);
             game.TurnStartedAt = game.TimeControl is null ? null : now;
+            UpdateClockExpiry(game, now);
             game.Version++;
         }
 
@@ -419,46 +427,6 @@ public sealed class GameService(
         return view;
     }
 
-    public async Task<ReplayView> ReplayAsync(Guid gameId, Guid playerId, CancellationToken cancellationToken)
-    {
-        var game = await db.Games
-            .AsNoTracking()
-            .Include(value => value.Moves.OrderBy(move => move.Ply))
-            .SingleOrDefaultAsync(
-                value => value.Id == gameId && (value.RedPlayerId == playerId || value.BlackPlayerId == playerId),
-                cancellationToken)
-            ?? throw ApiException.NotFound();
-        if (game.Status != GameStatus.Finished)
-        {
-            throw ApiException.NotFound();
-        }
-
-        var frames = new List<ReplayFrameView>(game.Moves.Count + 1);
-        var initial = stateSerializer.Deserialize(game.InitialStateJson);
-        frames.Add(new ReplayFrameView(0, initial.SideToMove, projector.ProjectFullPieces(initial), null));
-        foreach (var move in game.Moves.OrderBy(value => value.Ply))
-        {
-            var state = stateSerializer.Deserialize(move.StateAfterJson);
-            frames.Add(new ReplayFrameView(
-                move.Ply,
-                state.SideToMove,
-                projector.ProjectFullPieces(state),
-                new ReplayMoveView(
-                    move.Ply,
-                    move.Side,
-                    move.MovingPieceType,
-                    new ApiPosition(move.FromFile, move.FromRank),
-                    new ApiPosition(move.ToFile, move.ToRank),
-                    move.CapturedPieceType)));
-        }
-
-        return new ReplayView(
-            game.Id,
-            game.RuleVersion,
-            GameFactory.GetSide(game, playerId),
-            GameViewProjector.MapResult(game),
-            frames);
-    }
 
     private async Task FinishGameAsync(
         GameEntity game,
@@ -470,7 +438,14 @@ public sealed class GameService(
         var room = await db.Rooms.SingleOrDefaultAsync(
             value => value.GameId == game.Id,
             cancellationToken);
-        GameFactory.Finish(game, room, winner, reason, now);
+        await completion.CompleteAsync(
+            db,
+            game,
+            room,
+            winner,
+            reason,
+            now,
+            cancellationToken);
     }
 
     private async Task<ApiGameView> ResolveMoveCommitConflictAsync(
@@ -571,6 +546,7 @@ public sealed class GameService(
             .ToListAsync(cancellationToken);
         var game = lockedGames.SingleOrDefault() ?? throw ApiException.NotFound();
         await db.Entry(game).Collection(value => value.Players).LoadAsync(cancellationToken);
+        await db.Entry(game).Reference(value => value.RatingSettlement).LoadAsync(cancellationToken);
         return game;
     }
 
@@ -620,6 +596,7 @@ public sealed class GameService(
         if (!HasTimedOut(game, timedOutSide))
         {
             game.TurnStartedAt = now;
+            UpdateClockExpiry(game, now);
             return (elapsed, false);
         }
 
@@ -684,6 +661,20 @@ public sealed class GameService(
         }
     }
 
+    private static void UpdateClockExpiry(GameEntity game, DateTimeOffset now)
+    {
+        if (game.Status != GameStatus.Playing || game.TimeControl is null)
+        {
+            game.ClockExpiresAt = null;
+            return;
+        }
+
+        var remaining = game.SideToMove == Side.Red
+            ? game.RedMilliseconds
+            : game.BlackMilliseconds;
+        game.ClockExpiresAt = remaining is null ? null : now.AddMilliseconds(remaining.Value);
+    }
+
     private static DomainPosition ToDomain(ApiPosition position) => new(position.File, position.Rank);
 
     private static DateTimeOffset ToDatabaseTimestamp(DateTimeOffset value)
@@ -702,9 +693,11 @@ public sealed class GameService(
 
 public sealed class GameClockWorker(
     IDbContextFactory<MistChessDbContext> contextFactory,
+    GameCompletionService completion,
     IGameNotifier notifier,
     TimeProvider timeProvider,
-    ILogger<GameClockWorker> logger) : BackgroundService
+    ILogger<GameClockWorker> logger,
+    MistChessMetrics metrics) : BackgroundService
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -731,19 +724,31 @@ public sealed class GameClockWorker(
     private async Task FinishExpiredGamesAsync(CancellationToken cancellationToken)
     {
         await using var db = await contextFactory.CreateDbContextAsync(cancellationToken);
+        await using var transaction = await db.Database.BeginTransactionAsync(
+            IsolationLevel.ReadCommitted,
+            cancellationToken);
         var now = timeProvider.GetUtcNow();
         var games = await db.Games
-            .Include(value => value.Players)
-            .Where(value => value.Status == GameStatus.Playing && value.TurnStartedAt != null)
+            .FromSqlInterpolated(
+                $"""
+                SELECT *
+                FROM games
+                WHERE status = 'Playing'
+                  AND clock_expires_at IS NOT NULL
+                  AND clock_expires_at <= {now}
+                ORDER BY clock_expires_at, id
+                FOR UPDATE SKIP LOCKED
+                LIMIT 32
+                """)
             .ToListAsync(cancellationToken);
+        var expiredAtByGame = games.ToDictionary(
+            game => game.Id,
+            game => game.ClockExpiresAt!.Value);
+        var completionByGame = new Dictionary<Guid, bool>(games.Count);
+
         foreach (var game in games)
         {
-            var remaining = game.SideToMove == Side.Red ? game.RedMilliseconds : game.BlackMilliseconds;
-            if (remaining is null || game.TurnStartedAt!.Value.AddMilliseconds(remaining.Value) > now)
-            {
-                continue;
-            }
-
+            await db.Entry(game).Collection(value => value.Players).LoadAsync(cancellationToken);
             var timedOutSide = game.SideToMove;
             if (timedOutSide == Side.Red)
             {
@@ -757,14 +762,520 @@ public sealed class GameClockWorker(
             var room = await db.Rooms.SingleOrDefaultAsync(
                 value => value.GameId == game.Id,
                 cancellationToken);
-            GameFactory.Finish(
+            completionByGame[game.Id] = await completion.CompleteAsync(
+                db,
                 game,
                 room,
                 timedOutSide == Side.Red ? Side.Black : Side.Red,
                 GameResultReason.Timeout.ToString(),
-                now);
-            await db.SaveChangesAsync(cancellationToken);
+                now,
+                cancellationToken);
+        }
+
+        await db.SaveChangesAsync(cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+        foreach (var game in games)
+        {
             await notifier.GameUpdatedAsync(game.Id, true, cancellationToken);
+            var delayMilliseconds = Math.Max(
+                0,
+                (now - expiredAtByGame[game.Id]).TotalMilliseconds);
+            metrics.RecordClockTimeout(
+                game.TimeControl,
+                delayMilliseconds,
+                duplicate: !completionByGame[game.Id]);
+            logger.LogInformation(
+                "Clock timeout completed gameId={GameId} timeControl={TimeControl} elapsedMilliseconds={ElapsedMilliseconds}",
+                game.Id,
+                game.TimeControl,
+                (long)delayMilliseconds);
         }
     }
+}
+
+public sealed record HistoricalReplayResponse(HistoricalReplayView View, string ETag);
+
+public sealed class HistoryService(
+    MistChessDbContext db,
+    IGameStateSerializer stateSerializer,
+    GameViewProjector projector,
+    TimeProvider timeProvider,
+    ILogger<HistoryService> logger,
+    MistChessMetrics metrics)
+{
+    public async Task<HistoricalGamesPageView> ListAsync(
+        Guid playerId,
+        string? cursor,
+        int limit,
+        string? ruleVersion,
+        string? timeControl,
+        string? result,
+        CancellationToken cancellationToken)
+    {
+        if (limit is < 1 or > 50)
+        {
+            throw ApiException.Unprocessable("INVALID_HISTORY_LIMIT", "History limit must be between 1 and 50.");
+        }
+
+        var started = Stopwatch.GetTimestamp();
+        var query = db.Games
+            .AsNoTracking()
+            .Where(game =>
+                game.Status == GameStatus.Finished &&
+                (game.RedPlayerId == playerId || game.BlackPlayerId == playerId));
+        if (!string.IsNullOrWhiteSpace(ruleVersion))
+        {
+            var normalizedRuleVersion = ruleVersion.Trim();
+            query = query.Where(game => game.RuleVersion == normalizedRuleVersion);
+        }
+
+        if (!string.IsNullOrWhiteSpace(timeControl))
+        {
+            if (StringComparer.OrdinalIgnoreCase.Equals(timeControl.Trim(), "untimed"))
+            {
+                query = query.Where(game => game.TimeControl == null);
+            }
+            else
+            {
+                var normalizedTimeControl = TimeControlSettings.Normalize(timeControl);
+                query = query.Where(game => game.TimeControl == normalizedTimeControl);
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(result))
+        {
+            query = result.Trim().ToLowerInvariant() switch
+            {
+                "win" => query.Where(game =>
+                    (game.RedPlayerId == playerId && game.Winner == Side.Red) ||
+                    (game.BlackPlayerId == playerId && game.Winner == Side.Black)),
+                "loss" => query.Where(game =>
+                    (game.RedPlayerId == playerId && game.Winner == Side.Black) ||
+                    (game.BlackPlayerId == playerId && game.Winner == Side.Red)),
+                "draw" => query.Where(game => game.Winner == null),
+                _ => throw ApiException.Unprocessable(
+                    "INVALID_HISTORY_RESULT",
+                    "History result must be win, loss, or draw.")
+            };
+        }
+
+        if (!string.IsNullOrWhiteSpace(cursor))
+        {
+            var decoded = DecodeCursor(cursor);
+            query = query.Where(game =>
+                game.FinishedAt < decoded.FinishedAt ||
+                (game.FinishedAt == decoded.FinishedAt && game.Id.CompareTo(decoded.GameId) < 0));
+        }
+
+        var rows = await query
+            .OrderByDescending(game => game.FinishedAt)
+            .ThenByDescending(game => game.Id)
+            .Select(game => new HistoryRow(
+                game.Id,
+                game.FinishedAt!.Value,
+                game.RuleVersion,
+                game.TimeControl,
+                game.RedPlayerId,
+                game.BlackPlayerId,
+                game.RedPlayer.DisplayName,
+                game.BlackPlayer.DisplayName,
+                game.Winner,
+                game.ResultReason!,
+                game.Moves.Count,
+                game.RatingSettlement == null
+                    ? null
+                    : game.RatingSettlement.RedRatingBefore,
+                game.RatingSettlement == null
+                    ? null
+                    : game.RatingSettlement.BlackRatingBefore))
+            .Take(limit + 1)
+            .ToListAsync(cancellationToken);
+        var hasMore = rows.Count > limit;
+        if (hasMore)
+        {
+            rows.RemoveAt(rows.Count - 1);
+        }
+
+        var games = rows.Select(row => ToSummary(row, playerId)).ToArray();
+        var nextCursor = hasMore && rows.Count > 0
+            ? EncodeCursor(rows[^1].FinishedAt, rows[^1].GameId)
+            : null;
+        var elapsedMilliseconds = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+        logger.LogInformation(
+            "History listed playerId={PlayerId} count={Count} elapsedMilliseconds={ElapsedMilliseconds}",
+            playerId,
+            games.Length,
+            elapsedMilliseconds);
+        metrics.RecordHistoryList(elapsedMilliseconds);
+        return new HistoricalGamesPageView(games, nextCursor);
+    }
+
+    public async Task<HistoricalReplayResponse> PrivateReplayAsync(
+        Guid gameId,
+        Guid playerId,
+        CancellationToken cancellationToken)
+    {
+        var started = Stopwatch.GetTimestamp();
+        var game = await ReplayQuery()
+            .SingleOrDefaultAsync(
+                value =>
+                    value.Id == gameId &&
+                    value.Status == GameStatus.Finished &&
+                    (value.RedPlayerId == playerId || value.BlackPlayerId == playerId),
+                cancellationToken)
+            ?? throw ApiException.NotFound();
+        var side = GameFactory.GetSide(game, playerId);
+        var replay = BuildReplay(game, side);
+        var elapsedMilliseconds = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+        logger.LogInformation(
+            "Private replay rebuilt gameId={GameId} frameCount={FrameCount} elapsedMilliseconds={ElapsedMilliseconds}",
+            game.Id,
+            replay.Frames.Count,
+            elapsedMilliseconds);
+        metrics.RecordReplayBuild(shared: false, replay.Frames.Count, elapsedMilliseconds);
+        return new HistoricalReplayResponse(replay, CreateETag(game, side));
+    }
+
+    public async Task<HistoricalReplayView> SharedReplayAsync(
+        string shareToken,
+        CancellationToken cancellationToken)
+    {
+        var started = Stopwatch.GetTimestamp();
+        string tokenHash;
+        try
+        {
+            tokenHash = HashTokenOrNotFound(shareToken);
+        }
+        catch (ApiException)
+        {
+            metrics.RecordShareOperation("read_invalid");
+            throw;
+        }
+
+        var game = await ReplayQuery()
+            .SingleOrDefaultAsync(
+                value =>
+                    value.Status == GameStatus.Finished &&
+                    value.ReplayShares.Any(share =>
+                        share.TokenHash == tokenHash &&
+                        share.RevokedAt == null),
+                cancellationToken);
+        if (game is null)
+        {
+            metrics.RecordShareOperation("read_invalid");
+            throw ApiException.NotFound();
+        }
+
+        var replay = BuildReplay(game, null);
+        var elapsedMilliseconds = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+        logger.LogInformation(
+            "Shared replay read gameId={GameId} frameCount={FrameCount} elapsedMilliseconds={ElapsedMilliseconds}",
+            game.Id,
+            replay.Frames.Count,
+            elapsedMilliseconds);
+        metrics.RecordReplayBuild(shared: true, replay.Frames.Count, elapsedMilliseconds);
+        metrics.RecordShareOperation("read_valid");
+        return replay;
+    }
+
+    public async Task<ReplayShareCreatedView> CreateShareAsync(
+        Guid gameId,
+        Guid playerId,
+        CancellationToken cancellationToken)
+    {
+        await using var transaction = await db.Database.BeginTransactionAsync(
+            IsolationLevel.ReadCommitted,
+            cancellationToken);
+        var lockedGames = await db.Games
+            .FromSqlInterpolated(
+                $"""
+                SELECT *
+                FROM games
+                WHERE id = {gameId}
+                  AND status = 'Finished'
+                  AND (red_player_id = {playerId} OR black_player_id = {playerId})
+                FOR UPDATE
+                """)
+            .ToListAsync(cancellationToken);
+        var game = lockedGames.SingleOrDefault() ?? throw ApiException.NotFound();
+        var now = timeProvider.GetUtcNow();
+        var existing = await db.ReplayShares.SingleOrDefaultAsync(
+            value =>
+                value.GameId == game.Id &&
+                value.OwnerPlayerId == playerId &&
+                value.RevokedAt == null,
+            cancellationToken);
+        if (existing is not null)
+        {
+            existing.RevokedAt = now;
+        }
+
+        var token = WebEncoders.Base64UrlEncode(RandomNumberGenerator.GetBytes(32));
+        var share = new ReplayShareEntity
+        {
+            Id = Guid.NewGuid(),
+            GameId = game.Id,
+            OwnerPlayerId = playerId,
+            TokenHash = HashToken(token),
+            CreatedAt = now
+        };
+        db.ReplayShares.Add(share);
+        await db.SaveChangesAsync(cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+        logger.LogInformation(
+            "Replay share created gameId={GameId} ownerPlayerId={OwnerPlayerId} shareId={ShareId}",
+            game.Id,
+            playerId,
+            share.Id);
+        metrics.RecordShareOperation("created");
+        return new ReplayShareCreatedView($"/shared/replay/{token}", now);
+    }
+
+    public async Task RevokeShareAsync(
+        Guid gameId,
+        Guid playerId,
+        CancellationToken cancellationToken)
+    {
+        await using var transaction = await db.Database.BeginTransactionAsync(
+            IsolationLevel.ReadCommitted,
+            cancellationToken);
+        var lockedGames = await db.Games
+            .FromSqlInterpolated(
+                $"""
+                SELECT *
+                FROM games
+                WHERE id = {gameId}
+                  AND status = 'Finished'
+                  AND (red_player_id = {playerId} OR black_player_id = {playerId})
+                FOR UPDATE
+                """)
+            .ToListAsync(cancellationToken);
+        var game = lockedGames.SingleOrDefault() ?? throw ApiException.NotFound();
+        var share = await db.ReplayShares.SingleOrDefaultAsync(
+            value =>
+                value.GameId == game.Id &&
+                value.OwnerPlayerId == playerId &&
+                value.RevokedAt == null,
+            cancellationToken);
+        if (share is not null)
+        {
+            share.RevokedAt = timeProvider.GetUtcNow();
+            await db.SaveChangesAsync(cancellationToken);
+        }
+
+        await transaction.CommitAsync(cancellationToken);
+        logger.LogInformation(
+            "Replay share revoked gameId={GameId} ownerPlayerId={OwnerPlayerId} existed={Existed}",
+            game.Id,
+            playerId,
+            share is not null);
+        metrics.RecordShareOperation(share is null ? "revoke_missing" : "revoked");
+    }
+
+    private IQueryable<GameEntity> ReplayQuery() => db.Games
+        .AsNoTracking()
+        .Include(value => value.RedPlayer)
+        .Include(value => value.BlackPlayer)
+        .Include(value => value.RatingSettlement)
+        .Include(value => value.Moves.OrderBy(move => move.Ply));
+
+    private HistoricalReplayView BuildReplay(GameEntity game, Side? currentPlayerSide)
+    {
+        var orderedMoves = game.Moves.OrderBy(value => value.Ply).ToArray();
+        var frames = new List<HistoricalReplayFrameView>(orderedMoves.Length + 2);
+        var initial = stateSerializer.Deserialize(game.InitialStateJson);
+        var settings = TimeControlSettings.Parse(game.TimeControl);
+        frames.Add(BuildFrame(
+            initial,
+            0,
+            settings is null
+                ? null
+                : new ClockView(
+                    settings.InitialMilliseconds,
+                    settings.InitialMilliseconds,
+                    game.CreatedAt),
+            null));
+
+        foreach (var move in orderedMoves)
+        {
+            var state = stateSerializer.Deserialize(move.StateAfterJson);
+            var replayMove = new ReplayMoveView(
+                move.Ply,
+                move.Side,
+                move.MovingPieceType,
+                new ApiPosition(move.FromFile, move.FromRank),
+                new ApiPosition(move.ToFile, move.ToRank),
+                move.CapturedPieceType);
+            var clock = move.RedMillisecondsAfter is { } red &&
+                move.BlackMillisecondsAfter is { } black
+                ? new ClockView(red, black, move.CreatedAt)
+                : null;
+            frames.Add(BuildFrame(state, move.Ply, clock, replayMove));
+        }
+
+        var lastMoveResult = orderedMoves.LastOrDefault()?.ResultReasonAfter;
+        if (!StringComparer.Ordinal.Equals(lastMoveResult, game.ResultReason))
+        {
+            var finalState = stateSerializer.Deserialize(game.StateJson);
+            var finalClock = game.RedMilliseconds is { } red &&
+                game.BlackMilliseconds is { } black
+                ? new ClockView(red, black, game.FinishedAt!.Value)
+                : null;
+            frames.Add(BuildFrame(finalState, finalState.HalfMoveCount, finalClock, null));
+        }
+
+        return new HistoricalReplayView(
+            game.Id,
+            game.RuleVersion,
+            game.TimeControl,
+            currentPlayerSide,
+            ToHistoricalPlayer(game, Side.Red),
+            ToHistoricalPlayer(game, Side.Black),
+            GameViewProjector.MapResult(game),
+            frames);
+    }
+
+    private HistoricalReplayFrameView BuildFrame(
+        GameState state,
+        int ply,
+        ClockView? clock,
+        ReplayMoveView? move)
+    {
+        var redMove = move?.Side == Side.Red ? move : null;
+        var blackMove = move?.Side == Side.Black ? move : null;
+        return new HistoricalReplayFrameView(
+            ply,
+            state.SideToMove,
+            clock,
+            new ReplayFrameViewsView(
+                projector.ProjectReplayFrame(state, Side.Red, redMove),
+                projector.ProjectReplayFrame(state, Side.Black, blackMove),
+                projector.ProjectReplayFrame(state, null, move)));
+    }
+
+    private static HistoricalGameSummaryView ToSummary(HistoryRow row, Guid playerId)
+    {
+        var currentSide = row.RedPlayerId == playerId ? Side.Red : Side.Black;
+        return new HistoricalGameSummaryView(
+            row.GameId,
+            row.FinishedAt,
+            row.RuleVersion,
+            row.TimeControl,
+            currentSide,
+            new HistoricalPlayerView(
+                row.RedDisplayName,
+                OutcomeFor(Side.Red, row.Winner),
+                row.RedRatingBefore),
+            new HistoricalPlayerView(
+                row.BlackDisplayName,
+                OutcomeFor(Side.Black, row.Winner),
+                row.BlackRatingBefore),
+            new GameResultView(
+                row.Winner,
+                Enum.Parse<GameResultReason>(row.ResultReason, ignoreCase: true)),
+            row.PlyCount);
+    }
+
+    private static HistoricalPlayerView ToHistoricalPlayer(GameEntity game, Side side)
+    {
+        var displayName = side == Side.Red
+            ? game.RedPlayer.DisplayName
+            : game.BlackPlayer.DisplayName;
+        int? ratingBefore = game.RatingSettlement is null
+            ? null
+            : side == Side.Red
+                ? game.RatingSettlement.RedRatingBefore
+                : game.RatingSettlement.BlackRatingBefore;
+        return new HistoricalPlayerView(displayName, OutcomeFor(side, game.Winner), ratingBefore);
+    }
+
+    private static HistoricalOutcome OutcomeFor(Side side, Side? winner) => winner switch
+    {
+        null => HistoricalOutcome.Draw,
+        _ when winner == side => HistoricalOutcome.Win,
+        _ => HistoricalOutcome.Loss
+    };
+
+    private static string EncodeCursor(DateTimeOffset finishedAt, Guid gameId)
+    {
+        var value = string.Create(
+            CultureInfo.InvariantCulture,
+            $"{finishedAt.UtcTicks}:{gameId:N}");
+        return WebEncoders.Base64UrlEncode(Encoding.UTF8.GetBytes(value));
+    }
+
+    private static HistoryCursor DecodeCursor(string cursor)
+    {
+        try
+        {
+            var value = Encoding.UTF8.GetString(WebEncoders.Base64UrlDecode(cursor));
+            var separator = value.IndexOf(':', StringComparison.Ordinal);
+            if (separator <= 0 ||
+                !long.TryParse(
+                    value.AsSpan(0, separator),
+                    NumberStyles.None,
+                    CultureInfo.InvariantCulture,
+                    out var ticks) ||
+                !Guid.TryParseExact(value[(separator + 1)..], "N", out var gameId))
+            {
+                throw new FormatException();
+            }
+
+            return new HistoryCursor(new DateTimeOffset(ticks, TimeSpan.Zero), gameId);
+        }
+        catch (Exception exception) when (
+            exception is FormatException or ArgumentException or OverflowException)
+        {
+            throw ApiException.Unprocessable("INVALID_HISTORY_CURSOR", "The history cursor is invalid.");
+        }
+    }
+
+    private static string CreateETag(GameEntity game, Side? side)
+    {
+        var input = Encoding.UTF8.GetBytes(
+            $"{game.Id:N}:{game.Version}:{game.Moves.Count}:{side?.ToString() ?? "shared"}");
+        return $"\"{Convert.ToHexString(SHA256.HashData(input)).ToLowerInvariant()}\"";
+    }
+
+    private static string HashTokenOrNotFound(string token)
+    {
+        if (token.Length != 43)
+        {
+            throw ApiException.NotFound();
+        }
+
+        try
+        {
+            if (WebEncoders.Base64UrlDecode(token).Length != 32)
+            {
+                throw ApiException.NotFound();
+            }
+        }
+        catch (FormatException)
+        {
+            throw ApiException.NotFound();
+        }
+
+        return HashToken(token);
+    }
+
+    private static string HashToken(string token) =>
+        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(token))).ToLowerInvariant();
+
+    private sealed record HistoryCursor(DateTimeOffset FinishedAt, Guid GameId);
+
+    private sealed record HistoryRow(
+        Guid GameId,
+        DateTimeOffset FinishedAt,
+        string RuleVersion,
+        string? TimeControl,
+        Guid RedPlayerId,
+        Guid BlackPlayerId,
+        string RedDisplayName,
+        string BlackDisplayName,
+        Side? Winner,
+        string ResultReason,
+        int PlyCount,
+        int? RedRatingBefore,
+        int? BlackRatingBefore);
 }

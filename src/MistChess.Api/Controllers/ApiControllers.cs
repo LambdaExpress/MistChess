@@ -10,6 +10,16 @@ using ApiGameView = MistChess.Api.Contracts.GameView;
 namespace MistChess.Api.Controllers;
 
 [ApiController]
+[Route("api/game-options")]
+public sealed class GameOptionsController : ControllerBase
+{
+    [AllowAnonymous]
+    [HttpGet(Name = "getGameOptions")]
+    [ProducesResponseType<GameOptionsView>(StatusCodes.Status200OK)]
+    public ActionResult<GameOptionsView> Get() => Ok(GameOptionsCatalog.View);
+}
+
+[ApiController]
 [Route("api/sessions")]
 public sealed class SessionsController(GuestSessionService sessions) : ControllerBase
 {
@@ -134,8 +144,33 @@ public sealed class MatchmakingController(MatchmakingService matchmaking) : Cont
 [ApiController]
 [Authorize]
 [Route("api/games")]
-public sealed class GamesController(GameService games) : ControllerBase
+public sealed class GamesController(
+    GameService games,
+    HistoryService history,
+    MistChessMetrics metrics) : ControllerBase
 {
+    [HttpGet("history", Name = "getGameHistory")]
+    [EnableRateLimiting("history-read")]
+    [ProducesResponseType<HistoricalGamesPageView>(StatusCodes.Status200OK)]
+    public async Task<ActionResult<HistoricalGamesPageView>> History(
+        [FromQuery] string? cursor,
+        [FromQuery] int limit = 20,
+        [FromQuery] string? ruleVersion = null,
+        [FromQuery] string? timeControl = null,
+        [FromQuery] string? result = null,
+        CancellationToken cancellationToken = default)
+    {
+        Response.Headers.CacheControl = "private, no-store";
+        return Ok(await history.ListAsync(
+            CurrentPlayer.GetId(User),
+            cursor,
+            limit,
+            ruleVersion,
+            timeControl,
+            result,
+            cancellationToken));
+    }
+
     [HttpGet("{gameId:guid}", Name = "getGame")]
     [ProducesResponseType<ApiGameView>(StatusCodes.Status200OK)]
     [ProducesResponseType<ErrorResponse>(StatusCodes.Status404NotFound)]
@@ -183,8 +218,79 @@ public sealed class GamesController(GameService games) : ControllerBase
         Ok(await games.RejectDrawAsync(gameId, CurrentPlayer.GetId(User), cancellationToken));
 
     [HttpGet("{gameId:guid}/replay", Name = "getReplay")]
-    [ProducesResponseType<ReplayView>(StatusCodes.Status200OK)]
+    [EnableRateLimiting("history-read")]
+    [ProducesResponseType<HistoricalReplayView>(StatusCodes.Status200OK)]
     [ProducesResponseType<ErrorResponse>(StatusCodes.Status404NotFound)]
-    public async Task<ActionResult<ReplayView>> Replay(Guid gameId, CancellationToken cancellationToken) =>
-        Ok(await games.ReplayAsync(gameId, CurrentPlayer.GetId(User), cancellationToken));
+    public async Task<ActionResult<HistoricalReplayView>> Replay(
+        Guid gameId,
+        CancellationToken cancellationToken)
+    {
+        var replay = await history.PrivateReplayAsync(
+            gameId,
+            CurrentPlayer.GetId(User),
+            cancellationToken);
+        Response.Headers.CacheControl = "private, no-cache";
+        Response.Headers.Vary = "Cookie";
+        Response.Headers.ETag = replay.ETag;
+        var cacheHit = Request.Headers.IfNoneMatch.Any(value =>
+            StringComparer.Ordinal.Equals(value, replay.ETag));
+        metrics.RecordReplayCacheValidation(cacheHit);
+        if (cacheHit)
+        {
+            return StatusCode(StatusCodes.Status304NotModified);
+        }
+
+        return Ok(replay.View);
+    }
+
+    [HttpPost("{gameId:guid}/replay-share", Name = "createReplayShare")]
+    [ValidateAntiForgeryToken]
+    [EnableRateLimiting("share-change")]
+    [ProducesResponseType<ReplayShareCreatedView>(StatusCodes.Status200OK)]
+    [ProducesResponseType<ErrorResponse>(StatusCodes.Status404NotFound)]
+    public async Task<ActionResult<ReplayShareCreatedView>> CreateReplayShare(
+        Guid gameId,
+        CancellationToken cancellationToken)
+    {
+        Response.Headers.CacheControl = "private, no-store";
+        return Ok(await history.CreateShareAsync(
+            gameId,
+            CurrentPlayer.GetId(User),
+            cancellationToken));
+    }
+
+    [HttpDelete("{gameId:guid}/replay-share", Name = "revokeReplayShare")]
+    [ValidateAntiForgeryToken]
+    [EnableRateLimiting("share-change")]
+    [ProducesResponseType(StatusCodes.Status204NoContent)]
+    [ProducesResponseType<ErrorResponse>(StatusCodes.Status404NotFound)]
+    public async Task<IActionResult> RevokeReplayShare(
+        Guid gameId,
+        CancellationToken cancellationToken)
+    {
+        Response.Headers.CacheControl = "private, no-store";
+        await history.RevokeShareAsync(
+            gameId,
+            CurrentPlayer.GetId(User),
+            cancellationToken);
+        return NoContent();
+    }
+}
+
+[ApiController]
+[Route("api/replay-shares")]
+public sealed class ReplaySharesController(HistoryService history) : ControllerBase
+{
+    [AllowAnonymous]
+    [HttpGet("{shareToken}", Name = "getSharedReplay")]
+    [EnableRateLimiting("share-read")]
+    [ProducesResponseType<HistoricalReplayView>(StatusCodes.Status200OK)]
+    [ProducesResponseType<ErrorResponse>(StatusCodes.Status404NotFound)]
+    public async Task<ActionResult<HistoricalReplayView>> Get(
+        string shareToken,
+        CancellationToken cancellationToken)
+    {
+        Response.Headers.CacheControl = "private, no-store";
+        return Ok(await history.SharedReplayAsync(shareToken, cancellationToken));
+    }
 }

@@ -8,6 +8,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 using MistChess.Api.Application;
 using MistChess.Api.Contracts;
+using MistChess.Domain;
 using MistChess.Infrastructure.Persistence;
 
 namespace MistChess.Api.Security;
@@ -77,7 +78,10 @@ public sealed class GuestSessionService(
             var existing = await db.GuestSessions
                 .AsNoTracking()
                 .SingleAsync(value => value.Id == playerId, cancellationToken);
-            return new GuestSessionView(existing.Id, existing.DisplayName);
+            return new GuestSessionView(
+                existing.Id,
+                existing.DisplayName,
+                await GetRatingAsync(existing.Id, cancellationToken));
         }
 
         var now = timeProvider.GetUtcNow();
@@ -106,7 +110,37 @@ public sealed class GuestSessionService(
                 Expires = session.ExpiresAt
             });
 
-        return new GuestSessionView(session.Id, session.DisplayName);
+        return new GuestSessionView(
+            session.Id,
+            session.DisplayName,
+            new PlayerRatingView(
+                GameState.CurrentRuleVersion,
+                GameOptionsCatalog.QuickMatchTimeControlId,
+                1500,
+                0));
+    }
+
+    private async Task<PlayerRatingView> GetRatingAsync(Guid playerId, CancellationToken cancellationToken)
+    {
+        var rating = await db.PlayerRatings
+            .AsNoTracking()
+            .SingleOrDefaultAsync(
+                value =>
+                    value.PlayerId == playerId &&
+                    value.RuleVersion == GameState.CurrentRuleVersion &&
+                    value.TimeControl == GameOptionsCatalog.QuickMatchTimeControlId,
+                cancellationToken);
+        return rating is null
+            ? new PlayerRatingView(
+                GameState.CurrentRuleVersion,
+                GameOptionsCatalog.QuickMatchTimeControlId,
+                1500,
+                0)
+            : new PlayerRatingView(
+                rating.RuleVersion,
+                rating.TimeControl,
+                rating.Rating,
+                rating.GamesPlayed);
     }
 }
 

@@ -13,7 +13,8 @@ public sealed class MatchmakingService(
     MistChessDbContext db,
     MatchmakingCoordinator coordinator,
     ILobbyNotifier lobbyNotifier,
-    TimeProvider timeProvider)
+    TimeProvider timeProvider,
+    MistChessMetrics metrics)
 {
     private static readonly TimeSpan TicketLifetime = TimeSpan.FromSeconds(90);
     private const int MaxTransactionAttempts = 3;
@@ -34,7 +35,7 @@ public sealed class MatchmakingService(
             throw ApiException.Unprocessable("INVALID_CLIENT_REQUEST_ID", "A clientRequestId is required.");
         }
 
-        var timeControl = TimeControlSettings.Normalize(request.TimeControl);
+        const string timeControl = GameOptionsCatalog.QuickMatchTimeControlId;
         MatchmakingTicketEntity? created = null;
         for (var attempt = 1; attempt <= MaxTransactionAttempts; attempt++)
         {
@@ -80,13 +81,16 @@ public sealed class MatchmakingService(
                     await db.SaveChangesAsync(cancellationToken);
                 }
 
-                if (await db.GamePlayers.AnyAsync(
-                        value => value.PlayerId == playerId && value.IsActive,
-                        cancellationToken))
+                var activeGameId = await db.GamePlayers
+                    .Where(value => value.PlayerId == playerId && value.IsActive)
+                    .Select(value => (Guid?)value.GameId)
+                    .SingleOrDefaultAsync(cancellationToken);
+                if (activeGameId is not null)
                 {
                     throw ApiException.Conflict(
                         "ACTIVE_GAME_EXISTS",
-                        "The player already has an unfinished game.");
+                        "The player already has an unfinished game.",
+                        activeGameId);
                 }
 
                 if (await db.MatchmakingTickets.AnyAsync(
@@ -98,12 +102,37 @@ public sealed class MatchmakingService(
                         "The player already has an active matchmaking ticket.");
                 }
 
+                var rating = await db.PlayerRatings.SingleOrDefaultAsync(
+                    value =>
+                        value.PlayerId == playerId &&
+                        value.RuleVersion == request.RuleVersion &&
+                        value.TimeControl == timeControl,
+                    cancellationToken);
+                if (rating is null)
+                {
+                    rating = new PlayerRatingEntity
+                    {
+                        PlayerId = playerId,
+                        RuleVersion = request.RuleVersion,
+                        TimeControl = timeControl,
+                        Rating = 1500,
+                        GamesPlayed = 0,
+                        Wins = 0,
+                        Draws = 0,
+                        Losses = 0,
+                        UpdatedAt = now,
+                        ConcurrencyStamp = 0
+                    };
+                    db.PlayerRatings.Add(rating);
+                }
+
                 created = new MatchmakingTicketEntity
                 {
                     Id = Guid.NewGuid(),
                     PlayerId = playerId,
                     RuleVersion = request.RuleVersion,
                     TimeControl = timeControl,
+                    RatingSnapshot = rating.Rating,
                     Status = DbTicketStatus.Searching,
                     CreatedAt = now,
                     LastHeartbeatAt = now,
@@ -114,6 +143,13 @@ public sealed class MatchmakingService(
                 db.MatchmakingTickets.Add(created);
                 await db.SaveChangesAsync(cancellationToken);
                 await transaction.CommitAsync(cancellationToken);
+                foreach (var ticket in expired)
+                {
+                    metrics.RecordMatchmakingTicket(
+                        "expired",
+                        (now - ticket.CreatedAt).TotalMilliseconds);
+                }
+                metrics.RecordMatchmakingTicket("created", waitingMilliseconds: null);
                 break;
             }
             catch (Exception exception) when (
@@ -152,6 +188,9 @@ public sealed class MatchmakingService(
             ticket.Status = DbTicketStatus.Expired;
             ticket.ConcurrencyStamp++;
             await db.SaveChangesAsync(cancellationToken);
+            metrics.RecordMatchmakingTicket(
+                "expired",
+                (now - ticket.CreatedAt).TotalMilliseconds);
             var expiredView = ToView(ticket);
             await lobbyNotifier.TicketUpdatedAsync(playerId, expiredView, cancellationToken);
             return expiredView;
@@ -171,6 +210,9 @@ public sealed class MatchmakingService(
             ticket.Status = DbTicketStatus.Expired;
             ticket.ConcurrencyStamp++;
             await db.SaveChangesAsync(cancellationToken);
+            metrics.RecordMatchmakingTicket(
+                "expired",
+                (now - ticket.CreatedAt).TotalMilliseconds);
             var expiredView = ToView(ticket);
             await lobbyNotifier.TicketUpdatedAsync(playerId, expiredView, cancellationToken);
             return expiredView;
@@ -228,6 +270,9 @@ public sealed class MatchmakingService(
                 ticket.ConcurrencyStamp++;
                 await db.SaveChangesAsync(cancellationToken);
                 await transaction.CommitAsync(cancellationToken);
+                metrics.RecordMatchmakingTicket(
+                    ticket.Status == DbTicketStatus.Expired ? "expired" : "cancelled",
+                    (now - ticket.CreatedAt).TotalMilliseconds);
                 cancelledView = ToView(ticket);
                 break;
             }
@@ -280,12 +325,52 @@ internal static class MatchmakingConcurrency
         };
 }
 
+public sealed record MatchSearchRange(
+    int? EffectiveRadius,
+    int? PopulationBaseRadius,
+    int WaitingBonus,
+    string PopulationBand,
+    bool IsUnrestricted);
+
+public static class MatchmakingPolicy
+{
+    public static MatchSearchRange Calculate(int eligiblePopulation, TimeSpan anchorWaitingTime)
+    {
+        var (populationRadius, populationBand) = eligiblePopulation switch
+        {
+            <= 1 => (0, "one"),
+            <= 4 => ((int?)null, "2-4"),
+            <= 9 => (400, "5-9"),
+            <= 19 => (250, "10-19"),
+            <= 49 => (150, "20-49"),
+            _ => (100, "50+")
+        };
+        var totalSeconds = Math.Max(0, anchorWaitingTime.TotalSeconds);
+        var waitingBonus = totalSeconds switch
+        {
+            < 15 => 0,
+            < 30 => 100,
+            < 45 => 200,
+            < 60 => 400,
+            _ => 0
+        };
+        var unrestricted = populationRadius is null || totalSeconds >= 60;
+        return new MatchSearchRange(
+            unrestricted ? null : populationRadius + waitingBonus,
+            populationRadius,
+            waitingBonus,
+            populationBand,
+            unrestricted);
+    }
+}
+
 public sealed class MatchmakingCoordinator(
     IDbContextFactory<MistChessDbContext> contextFactory,
     GameFactory gameFactory,
     ILobbyNotifier lobbyNotifier,
     TimeProvider timeProvider,
-    ILogger<MatchmakingCoordinator> logger)
+    ILogger<MatchmakingCoordinator> logger,
+    MistChessMetrics metrics)
 {
     private readonly SemaphoreSlim _mutex = new(1, 1);
 
@@ -337,63 +422,192 @@ public sealed class MatchmakingCoordinator(
             IsolationLevel.ReadCommitted,
             cancellationToken);
         var now = timeProvider.GetUtcNow();
-        var lockedSearchingTickets = await db.MatchmakingTickets
+        var expiredTickets = await db.MatchmakingTickets
             .FromSqlInterpolated(
-                $"SELECT * FROM matchmaking_tickets WHERE status = 'Searching' ORDER BY created_at, id FOR UPDATE")
+                $"""
+                SELECT *
+                FROM matchmaking_tickets
+                WHERE status = 'Searching'
+                  AND expires_at <= {now}
+                ORDER BY expires_at, id
+                FOR UPDATE SKIP LOCKED
+                LIMIT 100
+                """)
             .ToListAsync(cancellationToken);
-        var expiredTickets = lockedSearchingTickets
-            .Where(value => value.ExpiresAt <= now)
-            .ToArray();
         foreach (var expired in expiredTickets)
         {
             expired.Status = DbTicketStatus.Expired;
             expired.ConcurrencyStamp++;
         }
 
-        var searching = lockedSearchingTickets
-            .Where(value => value.ExpiresAt > now)
-            .ToArray();
-        var pair = searching
-            .GroupBy(value => new { value.RuleVersion, value.TimeControl })
-            .Select(group => group.Take(2).ToArray())
-            .Where(values => values.Length == 2 && values[0].PlayerId != values[1].PlayerId)
-            .OrderBy(values => values[0].CreatedAt)
-            .ThenBy(values => values[0].Id)
-            .FirstOrDefault();
-        if (pair is null)
+        var anchors = await db.MatchmakingTickets
+            .FromSqlInterpolated(
+                $"""
+                SELECT ticket.*
+                FROM matchmaking_tickets AS ticket
+                WHERE ticket.status = 'Searching'
+                  AND ticket.time_control = {GameOptionsCatalog.QuickMatchTimeControlId}
+                  AND ticket.expires_at > {now}
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM game_players AS participant
+                      WHERE participant.player_id = ticket.player_id
+                        AND participant.is_active)
+                ORDER BY ticket.created_at, ticket.id
+                FOR UPDATE SKIP LOCKED
+                LIMIT 1
+                """)
+            .ToListAsync(cancellationToken);
+        var anchor = anchors.SingleOrDefault();
+        if (anchor is null)
         {
-            if (expiredTickets.Length > 0)
-            {
-                await db.SaveChangesAsync(cancellationToken);
-            }
-
+            await db.SaveChangesAsync(cancellationToken);
             await transaction.CommitAsync(cancellationToken);
+            RecordTicketOutcomes(expiredTickets, now);
             await NotifyTicketUpdatesAsync(expiredTickets, cancellationToken);
             return false;
         }
 
-        var playerIds = pair.Select(value => value.PlayerId).ToArray();
-        if (await db.GamePlayers.AnyAsync(
-                value => playerIds.Contains(value.PlayerId) && value.IsActive,
-                cancellationToken))
+        var eligiblePopulation = await db.MatchmakingTickets
+            .AsNoTracking()
+            .Where(ticket =>
+                ticket.Status == DbTicketStatus.Searching &&
+                ticket.RuleVersion == anchor.RuleVersion &&
+                ticket.TimeControl == GameOptionsCatalog.QuickMatchTimeControlId &&
+                ticket.ExpiresAt > now &&
+                !db.GamePlayers.Any(participant =>
+                    participant.PlayerId == ticket.PlayerId &&
+                    participant.IsActive))
+            .Select(ticket => ticket.PlayerId)
+            .Distinct()
+            .CountAsync(cancellationToken);
+        var searchRange = MatchmakingPolicy.Calculate(
+            eligiblePopulation,
+            now - anchor.CreatedAt);
+
+        List<MatchmakingTicketEntity> candidates;
+        if (searchRange.EffectiveRadius is { } radius)
         {
-            foreach (var ticket in pair)
+            candidates = await db.MatchmakingTickets
+                .FromSqlInterpolated(
+                    $"""
+                    SELECT ticket.*
+                    FROM matchmaking_tickets AS ticket
+                    WHERE ticket.status = 'Searching'
+                      AND ticket.id <> {anchor.Id}
+                      AND ticket.player_id <> {anchor.PlayerId}
+                      AND ticket.rule_version = {anchor.RuleVersion}
+                      AND ticket.time_control = {GameOptionsCatalog.QuickMatchTimeControlId}
+                      AND ticket.expires_at > {now}
+                      AND ABS(ticket.rating_snapshot - {anchor.RatingSnapshot}) <= {radius}
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM game_players AS participant
+                          WHERE participant.player_id = ticket.player_id
+                            AND participant.is_active)
+                    ORDER BY ABS(ticket.rating_snapshot - {anchor.RatingSnapshot}), ticket.created_at, ticket.id
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT 1
+                    """)
+                .ToListAsync(cancellationToken);
+        }
+        else
+        {
+            candidates = await db.MatchmakingTickets
+                .FromSqlInterpolated(
+                    $"""
+                    SELECT ticket.*
+                    FROM matchmaking_tickets AS ticket
+                    WHERE ticket.status = 'Searching'
+                      AND ticket.id <> {anchor.Id}
+                      AND ticket.player_id <> {anchor.PlayerId}
+                      AND ticket.rule_version = {anchor.RuleVersion}
+                      AND ticket.time_control = {GameOptionsCatalog.QuickMatchTimeControlId}
+                      AND ticket.expires_at > {now}
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM game_players AS participant
+                          WHERE participant.player_id = ticket.player_id
+                            AND participant.is_active)
+                    ORDER BY ABS(ticket.rating_snapshot - {anchor.RatingSnapshot}), ticket.created_at, ticket.id
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT 1
+                    """)
+                .ToListAsync(cancellationToken);
+        }
+
+        var candidate = candidates.SingleOrDefault();
+        var waitingMilliseconds = Math.Max(0, (now - anchor.CreatedAt).TotalMilliseconds);
+        metrics.RecordMatchmakingScan(
+            eligiblePopulation,
+            searchRange,
+            waitingMilliseconds,
+            candidate is not null);
+        logger.LogInformation(
+            "Matchmaking scan anchorTicketId={AnchorTicketId} eligiblePopulation={EligiblePopulation} populationBand={PopulationBand} waitingMilliseconds={WaitingMilliseconds} populationBaseRadius={PopulationBaseRadius} waitingBonus={WaitingBonus} effectiveRadius={EffectiveRadius} unrestricted={Unrestricted}",
+            anchor.Id,
+            eligiblePopulation,
+            searchRange.PopulationBand,
+            (long)waitingMilliseconds,
+            searchRange.PopulationBaseRadius,
+            searchRange.WaitingBonus,
+            searchRange.EffectiveRadius,
+            searchRange.IsUnrestricted);
+        if (candidate is null)
+        {
+            await db.SaveChangesAsync(cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+            RecordTicketOutcomes(expiredTickets, now);
+            await NotifyTicketUpdatesAsync(expiredTickets, cancellationToken);
+            return false;
+        }
+
+        var pair = new[] { anchor, candidate };
+        var playerIds = pair.Select(value => value.PlayerId).OrderBy(value => value).ToArray();
+        var lockedPlayers = await db.GuestSessions
+            .FromSqlInterpolated(
+                $"""
+                SELECT *
+                FROM guest_sessions
+                WHERE id IN ({playerIds[0]}, {playerIds[1]})
+                ORDER BY id
+                FOR UPDATE
+                """)
+            .ToListAsync(cancellationToken);
+        var invalidPair =
+            lockedPlayers.Count != 2 ||
+            pair.Any(ticket =>
+                ticket.Status != DbTicketStatus.Searching ||
+                ticket.ExpiresAt <= now ||
+                ticket.RuleVersion != anchor.RuleVersion ||
+                ticket.TimeControl != GameOptionsCatalog.QuickMatchTimeControlId) ||
+            await db.GamePlayers.AnyAsync(
+                value => playerIds.Contains(value.PlayerId) && value.IsActive,
+                cancellationToken);
+        if (invalidPair)
+        {
+            foreach (var ticket in pair.Where(value => value.Status == DbTicketStatus.Searching))
             {
-                ticket.Status = DbTicketStatus.Cancelled;
+                ticket.Status = ticket.ExpiresAt <= now
+                    ? DbTicketStatus.Expired
+                    : DbTicketStatus.Cancelled;
                 ticket.ConcurrencyStamp++;
             }
 
             await db.SaveChangesAsync(cancellationToken);
             await transaction.CommitAsync(cancellationToken);
+            RecordTicketOutcomes(expiredTickets, now);
+            RecordTicketOutcomes(pair, now);
             await NotifyTicketUpdatesAsync(expiredTickets.Concat(pair), cancellationToken);
             return true;
         }
 
         var game = gameFactory.Create(
-            pair[0].PlayerId,
-            pair[1].PlayerId,
-            pair[0].RuleVersion,
-            pair[0].TimeControl);
+            anchor.PlayerId,
+            candidate.PlayerId,
+            anchor.RuleVersion,
+            GameOptionsCatalog.QuickMatchTimeControlId,
+            isRated: true);
         db.Games.Add(game);
         foreach (var ticket in pair)
         {
@@ -404,8 +618,9 @@ public sealed class MatchmakingCoordinator(
 
         await db.SaveChangesAsync(cancellationToken);
         await transaction.CommitAsync(cancellationToken);
+        RecordTicketOutcomes(expiredTickets, now);
+        RecordTicketOutcomes(pair, now);
         await NotifyTicketUpdatesAsync(expiredTickets, cancellationToken);
-
         foreach (var ticket in pair)
         {
             try
@@ -428,11 +643,30 @@ public sealed class MatchmakingCoordinator(
         }
 
         logger.LogInformation(
-            "Match created gameId={GameId} redPlayerId={RedPlayerId} blackPlayerId={BlackPlayerId}",
+            "Match created gameId={GameId} redPlayerId={RedPlayerId} blackPlayerId={BlackPlayerId} ratingDifference={RatingDifference} elapsedMilliseconds={ElapsedMilliseconds}",
             game.Id,
             game.RedPlayerId,
-            game.BlackPlayerId);
+            game.BlackPlayerId,
+            Math.Abs(anchor.RatingSnapshot - candidate.RatingSnapshot),
+            Math.Max(0, (long)(now - anchor.CreatedAt).TotalMilliseconds));
+        metrics.RecordMatch(
+            searchRange.PopulationBand,
+            searchRange.IsUnrestricted,
+            Math.Abs(anchor.RatingSnapshot - candidate.RatingSnapshot),
+            waitingMilliseconds);
         return true;
+    }
+
+    private void RecordTicketOutcomes(
+        IEnumerable<MatchmakingTicketEntity> tickets,
+        DateTimeOffset now)
+    {
+        foreach (var ticket in tickets)
+        {
+            metrics.RecordMatchmakingTicket(
+                ticket.Status.ToString().ToLowerInvariant(),
+                (now - ticket.CreatedAt).TotalMilliseconds);
+        }
     }
 
     private async Task NotifyTicketUpdatesAsync(

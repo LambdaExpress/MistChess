@@ -57,6 +57,14 @@ public sealed class ProtocolSecurityTests : IDisposable
         document.Should().NotContain("checkedSide");
         document.Should().NotContain("isInCheck");
         document.Should().NotContain("generalThreatened");
+        document.Should().NotContain("eligiblePopulation");
+        document.Should().NotContain("populationBand");
+        document.Should().NotContain("populationBaseRadius");
+        document.Should().NotContain("waitingBonus");
+        document.Should().NotContain("effectiveRadius");
+        document.Should().NotContain("ratingSnapshot");
+        document.Should().NotContain("tokenHash");
+        document.Should().NotContain("ownerPlayerId");
     }
 
     [Fact]

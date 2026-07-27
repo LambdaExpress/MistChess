@@ -20,7 +20,7 @@ public sealed class RoomService(
         CancellationToken cancellationToken)
     {
         ValidateRuleVersion(request.RuleVersion);
-        var timeControl = TimeControlSettings.Normalize(request.TimeControl);
+        var timeControl = GameOptionsCatalog.NormalizeRoomTimeControl(request.TimeControl);
         await EnsurePlayerCanStartGameAsync(playerId, cancellationToken);
         var now = timeProvider.GetUtcNow();
         var room = new RoomEntity

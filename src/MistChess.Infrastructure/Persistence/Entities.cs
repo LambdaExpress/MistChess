@@ -62,6 +62,7 @@ public sealed class MatchmakingTicketEntity
     public GuestSessionEntity Player { get; set; } = null!;
     public required string RuleVersion { get; set; }
     public string? TimeControl { get; set; }
+    public int RatingSnapshot { get; set; }
     public MatchTicketStatus Status { get; set; }
     public DateTimeOffset CreatedAt { get; set; }
     public DateTimeOffset LastHeartbeatAt { get; set; }
@@ -87,9 +88,11 @@ public sealed class GameEntity
     public string? ResultReason { get; set; }
     public required string RuleVersion { get; set; }
     public string? TimeControl { get; set; }
+    public bool IsRated { get; set; }
     public long? RedMilliseconds { get; set; }
     public long? BlackMilliseconds { get; set; }
     public DateTimeOffset? TurnStartedAt { get; set; }
+    public DateTimeOffset? ClockExpiresAt { get; set; }
     public long Version { get; set; }
     public DateTimeOffset CreatedAt { get; set; }
     public DateTimeOffset UpdatedAt { get; set; }
@@ -98,6 +101,8 @@ public sealed class GameEntity
     public List<MoveCommandReceiptEntity> MoveCommandReceipts { get; set; } = [];
     public List<DrawOfferEntity> DrawOffers { get; set; } = [];
     public List<GamePlayerEntity> Players { get; set; } = [];
+    public RatingSettlementEntity? RatingSettlement { get; set; }
+    public List<ReplayShareEntity> ReplayShares { get; set; } = [];
 }
 
 public sealed class GamePlayerEntity
@@ -164,4 +169,43 @@ public sealed class DrawOfferEntity
     public DrawOfferStatus Status { get; set; }
     public DateTimeOffset CreatedAt { get; set; }
     public DateTimeOffset UpdatedAt { get; set; }
+}
+
+public sealed class PlayerRatingEntity
+{
+    public Guid PlayerId { get; set; }
+    public GuestSessionEntity Player { get; set; } = null!;
+    public required string RuleVersion { get; set; }
+    public required string TimeControl { get; set; }
+    public int Rating { get; set; }
+    public int GamesPlayed { get; set; }
+    public int Wins { get; set; }
+    public int Draws { get; set; }
+    public int Losses { get; set; }
+    public DateTimeOffset UpdatedAt { get; set; }
+    public int ConcurrencyStamp { get; set; }
+}
+
+public sealed class RatingSettlementEntity
+{
+    public Guid GameId { get; set; }
+    public GameEntity Game { get; set; } = null!;
+    public int RedRatingBefore { get; set; }
+    public int RedRatingAfter { get; set; }
+    public int BlackRatingBefore { get; set; }
+    public int BlackRatingAfter { get; set; }
+    public decimal RedScore { get; set; }
+    public DateTimeOffset SettledAt { get; set; }
+}
+
+public sealed class ReplayShareEntity
+{
+    public Guid Id { get; set; }
+    public Guid GameId { get; set; }
+    public GameEntity Game { get; set; } = null!;
+    public Guid OwnerPlayerId { get; set; }
+    public GuestSessionEntity OwnerPlayer { get; set; } = null!;
+    public required string TokenHash { get; set; }
+    public DateTimeOffset CreatedAt { get; set; }
+    public DateTimeOffset? RevokedAt { get; set; }
 }

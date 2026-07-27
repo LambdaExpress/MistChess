@@ -1,8 +1,11 @@
 using System.Net;
 using System.Net.Http.Json;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using FluentAssertions;
+using Microsoft.Extensions.DependencyInjection;
+using MistChess.Api.Application;
 using MistChess.Api.Contracts;
 using MistChess.Api.Tests.Infrastructure;
 using MistChess.Domain;
@@ -103,11 +106,11 @@ public sealed class PostgresApiWorkflowTests(PostgresDatabaseFixture database) :
         resigned.VisibleSquares.Should().HaveCount(90);
         resigned.Pieces.Should().HaveCount(32);
 
-        var firstReplay = await GetAsync<ReplayView>(first, $"/api/games/{gameId:D}/replay");
-        var secondReplay = await GetAsync<ReplayView>(second, $"/api/games/{gameId:D}/replay");
+        var firstReplay = await GetAsync<HistoricalReplayView>(first, $"/api/games/{gameId:D}/replay");
+        var secondReplay = await GetAsync<HistoricalReplayView>(second, $"/api/games/{gameId:D}/replay");
         firstReplay.Result.Should().BeEquivalentTo(secondReplay.Result);
-        firstReplay.Frames.Should().HaveCount(2);
-        firstReplay.Frames[0].Pieces.Should().HaveCount(32);
+        firstReplay.Frames.Should().HaveCount(3);
+        firstReplay.Frames[^1].Views.Omniscient.Move.Should().BeNull();
     }
 
     [Fact]
@@ -187,7 +190,7 @@ public sealed class PostgresApiWorkflowTests(PostgresDatabaseFixture database) :
         var room = await PostAsync<RoomView>(
             first,
             "/api/rooms",
-            new CreateRoomRequest(GameState.CurrentRuleVersion, "60+0"));
+            new CreateRoomRequest(GameState.CurrentRuleVersion, "60+1"));
         await PostAsync<RoomView>(second, $"/api/rooms/{room.Code}/join", body: null);
         await PostAsync<RoomView>(first, $"/api/rooms/{room.Code}/ready", new SetReadyRequest(true));
         var started = await PostAsync<RoomView>(
@@ -231,7 +234,7 @@ public sealed class PostgresApiWorkflowTests(PostgresDatabaseFixture database) :
         var room = await PostAsync<RoomView>(
             first,
             "/api/rooms",
-            new CreateRoomRequest(GameState.CurrentRuleVersion, "60+0"));
+            new CreateRoomRequest(GameState.CurrentRuleVersion, "60+1"));
         await PostAsync<RoomView>(second, $"/api/rooms/{room.Code}/join", body: null);
         await PostAsync<RoomView>(first, $"/api/rooms/{room.Code}/ready", new SetReadyRequest(true));
         var started = await PostAsync<RoomView>(
@@ -275,7 +278,7 @@ public sealed class PostgresApiWorkflowTests(PostgresDatabaseFixture database) :
         var room = await PostAsync<RoomView>(
             first,
             "/api/rooms",
-            new CreateRoomRequest(GameState.CurrentRuleVersion, "60+0"));
+            new CreateRoomRequest(GameState.CurrentRuleVersion, "60+1"));
         await PostAsync<RoomView>(second, $"/api/rooms/{room.Code}/join", body: null);
         await PostAsync<RoomView>(first, $"/api/rooms/{room.Code}/ready", new SetReadyRequest(true));
         var started = await PostAsync<RoomView>(
@@ -310,9 +313,9 @@ public sealed class PostgresApiWorkflowTests(PostgresDatabaseFixture database) :
 
         firstResult.Result.Should().Be(new GameResultView(expectedWinner, GameResultReason.Timeout));
         repeatedResult.Should().BeEquivalentTo(firstResult);
-        var replay = await GetAsync<ReplayView>(movingClient, $"/api/games/{gameId:D}/replay");
-        replay.Frames.Should().ContainSingle();
-        replay.Frames[0].Move.Should().BeNull();
+        var replay = await GetAsync<HistoricalReplayView>(movingClient, $"/api/games/{gameId:D}/replay");
+        replay.Frames.Should().HaveCount(2);
+        replay.Frames.Should().OnlyContain(frame => frame.Views.Omniscient.Move == null);
 
         await using var connection = new NpgsqlConnection(database.ConnectionString);
         await connection.OpenAsync();
@@ -396,18 +399,17 @@ public sealed class PostgresApiWorkflowTests(PostgresDatabaseFixture database) :
     {
         using var first = await CreatePlayerAsync();
         using var second = await CreatePlayerAsync();
-        const string timeControl = "75+0";
         var firstTicket = await PostAsync<MatchTicketView>(
             first,
             "/api/matchmaking/tickets",
-            Ticket("cancel-race-a", timeControl));
+            Ticket("cancel-race-a"));
 
         var competing = await Task.WhenAll(
             first.DeleteAsync($"/api/matchmaking/tickets/{firstTicket.TicketId:D}"),
             PostResponseAsync(
                 second,
                 "/api/matchmaking/tickets",
-                Ticket("cancel-race-b", timeControl)));
+                Ticket("cancel-race-b")));
         var cancellation = competing[0];
         var creation = competing[1];
         creation.StatusCode.Should().Be(HttpStatusCode.OK);
@@ -463,7 +465,7 @@ public sealed class PostgresApiWorkflowTests(PostgresDatabaseFixture database) :
         var ticketCreationTask = PostResponseAsync(
             participant,
             "/api/matchmaking/tickets",
-            Ticket(requestId, null));
+            Ticket(requestId));
 
         await using var monitorConnection = new NpgsqlConnection(database.ConnectionString);
         await monitorConnection.OpenAsync();
@@ -546,33 +548,162 @@ public sealed class PostgresApiWorkflowTests(PostgresDatabaseFixture database) :
     }
 
     [Fact]
-    public async Task Matchmaking_is_idempotent_pool_exact_fifo_and_atomic()
+    public async Task Matchmaking_is_idempotent_uses_fixed_quick_time_and_pairs_fifo_at_low_population()
     {
         using var first = await CreatePlayerAsync();
         using var second = await CreatePlayerAsync();
         using var third = await CreatePlayerAsync();
         using var fourth = await CreatePlayerAsync();
 
-        var firstTicket = await PostAsync<MatchTicketView>(first, "/api/matchmaking/tickets", Ticket("first", null));
-        var repeated = await PostAsync<MatchTicketView>(first, "/api/matchmaking/tickets", Ticket("first", null));
+        var firstTicket = await PostAsync<MatchTicketView>(first, "/api/matchmaking/tickets", Ticket("first"));
+        var repeated = await PostAsync<MatchTicketView>(first, "/api/matchmaking/tickets", Ticket("first"));
         repeated.TicketId.Should().Be(firstTicket.TicketId);
 
-        var secondTicket = await PostAsync<MatchTicketView>(second, "/api/matchmaking/tickets", Ticket("second", "60+0"));
-        secondTicket.Status.Should().Be(MatchTicketStatus.Searching);
-        var thirdTicket = await PostAsync<MatchTicketView>(third, "/api/matchmaking/tickets", Ticket("third", null));
-        thirdTicket.Status.Should().Be(MatchTicketStatus.Matched);
-
+        var secondTicket = await PostAsync<MatchTicketView>(second, "/api/matchmaking/tickets", Ticket("second"));
+        secondTicket.Status.Should().Be(MatchTicketStatus.Matched);
+        secondTicket.TimeControl.Should().Be("600+5");
         var firstCurrent = await GetAsync<MatchTicketView>(first, "/api/matchmaking/tickets/current");
         firstCurrent.Status.Should().Be(MatchTicketStatus.Matched);
-        firstCurrent.GameId.Should().Be(thirdTicket.GameId);
+        firstCurrent.GameId.Should().Be(secondTicket.GameId);
 
-        var fourthTicket = await PostAsync<MatchTicketView>(fourth, "/api/matchmaking/tickets", Ticket("fourth", "60+0"));
+        var thirdTicket = await PostAsync<MatchTicketView>(third, "/api/matchmaking/tickets", Ticket("third"));
+        thirdTicket.Status.Should().Be(MatchTicketStatus.Searching);
+        var fourthTicket = await PostAsync<MatchTicketView>(fourth, "/api/matchmaking/tickets", Ticket("fourth"));
         fourthTicket.Status.Should().Be(MatchTicketStatus.Matched);
-        var secondCurrent = await GetAsync<MatchTicketView>(second, "/api/matchmaking/tickets/current");
-        secondCurrent.GameId.Should().Be(fourthTicket.GameId);
-        secondCurrent.GameId.Should().NotBeNull();
+        var thirdCurrent = await GetAsync<MatchTicketView>(third, "/api/matchmaking/tickets/current");
+        thirdCurrent.GameId.Should().Be(fourthTicket.GameId);
+        thirdCurrent.GameId.Should().NotBeNull();
         firstCurrent.GameId.Should().NotBeNull();
-        secondCurrent.GameId.Value.Should().NotBe(firstCurrent.GameId.Value);
+        thirdCurrent.GameId.Value.Should().NotBe(firstCurrent.GameId.Value);
+    }
+
+    [Fact]
+    public async Task Matchmaking_prefers_the_closest_rating_before_waiting_order()
+    {
+        using var anchor = await CreatePlayerAsync();
+        using var olderButFarther = await CreatePlayerAsync();
+        using var close = await CreatePlayerAsync();
+        using var exact = await CreatePlayerAsync();
+        using var remaining = await CreatePlayerAsync();
+        var anchorSession = await PostAsync<GuestSessionView>(anchor, "/api/sessions/guest", body: null);
+        var fartherSession = await PostAsync<GuestSessionView>(olderButFarther, "/api/sessions/guest", body: null);
+        var closeSession = await PostAsync<GuestSessionView>(close, "/api/sessions/guest", body: null);
+        var exactSession = await PostAsync<GuestSessionView>(exact, "/api/sessions/guest", body: null);
+        var remainingSession = await PostAsync<GuestSessionView>(remaining, "/api/sessions/guest", body: null);
+        var now = DateTimeOffset.UtcNow;
+        var tickets = new[]
+        {
+            (Guid.NewGuid(), anchorSession.PlayerId, 1500, 0),
+            (Guid.NewGuid(), fartherSession.PlayerId, 1800, 1),
+            (Guid.NewGuid(), closeSession.PlayerId, 1510, 2),
+            (Guid.NewGuid(), exactSession.PlayerId, 1500, 3),
+            (Guid.NewGuid(), remainingSession.PlayerId, 1490, 4)
+        };
+
+        await using (var connection = new NpgsqlConnection(database.ConnectionString))
+        {
+            await connection.OpenAsync();
+            foreach (var ticket in tickets)
+            {
+                await using var command = new NpgsqlCommand(
+                    """
+                    INSERT INTO matchmaking_tickets
+                        (id, player_id, rule_version, time_control, rating_snapshot, status,
+                         created_at, last_heartbeat_at, expires_at, client_request_id, concurrency_stamp)
+                    VALUES
+                        (@id, @player_id, @rule_version, '600+5', @rating, 'Searching',
+                         @created_at, @now, @expires_at, @request_id, 0)
+                    """,
+                    connection);
+                command.Parameters.AddWithValue("id", ticket.Item1);
+                command.Parameters.AddWithValue("player_id", ticket.PlayerId);
+                command.Parameters.AddWithValue("rule_version", GameState.CurrentRuleVersion);
+                command.Parameters.AddWithValue("rating", ticket.Item3);
+                command.Parameters.AddWithValue("created_at", now.AddSeconds(ticket.Item4));
+                command.Parameters.AddWithValue("now", now);
+                command.Parameters.AddWithValue("expires_at", now.AddMinutes(5));
+                command.Parameters.AddWithValue("request_id", $"closest-{ticket.Item4}");
+                (await command.ExecuteNonQueryAsync()).Should().Be(1);
+            }
+        }
+
+        var coordinator = _factory.Services.GetRequiredService<MatchmakingCoordinator>();
+        await coordinator.TryMatchAsync(CancellationToken.None);
+
+        await using var resultConnection = new NpgsqlConnection(database.ConnectionString);
+        await resultConnection.OpenAsync();
+        await using var resultCommand = new NpgsqlCommand(
+            """
+            SELECT red_player_id, black_player_id
+            FROM games
+            WHERE red_player_id = @anchor OR black_player_id = @anchor
+            """,
+            resultConnection);
+        resultCommand.Parameters.AddWithValue("anchor", anchorSession.PlayerId);
+        await using var reader = await resultCommand.ExecuteReaderAsync();
+        (await reader.ReadAsync()).Should().BeTrue();
+        new[] { reader.GetGuid(0), reader.GetGuid(1) }.Should().BeEquivalentTo(
+            new[] { anchorSession.PlayerId, exactSession.PlayerId });
+        (await reader.ReadAsync()).Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task Rated_quick_match_snapshots_ratings_and_settles_once()
+    {
+        using var first = await CreatePlayerAsync();
+        using var second = await CreatePlayerAsync();
+        var firstTicket = await PostAsync<MatchTicketView>(
+            first,
+            "/api/matchmaking/tickets",
+            Ticket("rated-first"));
+        var secondTicket = await PostAsync<MatchTicketView>(
+            second,
+            "/api/matchmaking/tickets",
+            Ticket("rated-second"));
+        var gameId = secondTicket.GameId!.Value;
+
+        var finished = await PostAsync<ApiGameView>(first, $"/api/games/{gameId:D}/resign", body: null);
+        var repeated = await PostAsync<ApiGameView>(first, $"/api/games/{gameId:D}/resign", body: null);
+        var opponent = await GetAsync<ApiGameView>(second, $"/api/games/{gameId:D}");
+
+        finished.TimeControl.Should().Be("600+5");
+        finished.RatingChange.Should().Be(new RatingChangeView(1500, 1480, -20));
+        opponent.RatingChange.Should().Be(new RatingChangeView(1500, 1520, 20));
+        repeated.Version.Should().Be(finished.Version);
+        repeated.Result.Should().Be(finished.Result);
+        repeated.RatingChange.Should().Be(finished.RatingChange);
+
+        var firstSession = await PostAsync<GuestSessionView>(first, "/api/sessions/guest", body: null);
+        var secondSession = await PostAsync<GuestSessionView>(second, "/api/sessions/guest", body: null);
+        firstSession.Rating.Should().Be(new PlayerRatingView(
+            GameState.CurrentRuleVersion,
+            "600+5",
+            1480,
+            1));
+        secondSession.Rating.Should().Be(new PlayerRatingView(
+            GameState.CurrentRuleVersion,
+            "600+5",
+            1520,
+            1));
+
+        await using var connection = new NpgsqlConnection(database.ConnectionString);
+        await connection.OpenAsync();
+        await using var command = new NpgsqlCommand(
+            """
+            SELECT
+                (SELECT rating_snapshot FROM matchmaking_tickets WHERE id = @first_ticket),
+                (SELECT rating_snapshot FROM matchmaking_tickets WHERE id = @second_ticket),
+                (SELECT count(*) FROM rating_settlements WHERE game_id = @game_id)
+            """,
+            connection);
+        command.Parameters.AddWithValue("first_ticket", firstTicket.TicketId);
+        command.Parameters.AddWithValue("second_ticket", secondTicket.TicketId);
+        command.Parameters.AddWithValue("game_id", gameId);
+        await using var reader = await command.ExecuteReaderAsync();
+        (await reader.ReadAsync()).Should().BeTrue();
+        reader.GetInt32(0).Should().Be(1500);
+        reader.GetInt32(1).Should().Be(1500);
+        reader.GetInt64(2).Should().Be(1);
     }
 
     [Fact]
@@ -582,8 +713,8 @@ public sealed class PostgresApiWorkflowTests(PostgresDatabaseFixture database) :
         using var second = await CreatePlayerAsync();
 
         var responses = await Task.WhenAll(
-            PostAsync<MatchTicketView>(first, "/api/matchmaking/tickets", Ticket("parallel-a", null)),
-            PostAsync<MatchTicketView>(second, "/api/matchmaking/tickets", Ticket("parallel-b", null)));
+            PostAsync<MatchTicketView>(first, "/api/matchmaking/tickets", Ticket("parallel-a")),
+            PostAsync<MatchTicketView>(second, "/api/matchmaking/tickets", Ticket("parallel-b")));
 
         var recovered = await Task.WhenAll(
             GetAsync<MatchTicketView>(first, "/api/matchmaking/tickets/current"),
@@ -600,7 +731,7 @@ public sealed class PostgresApiWorkflowTests(PostgresDatabaseFixture database) :
         var ticket = await PostAsync<MatchTicketView>(
             activePlayer,
             "/api/matchmaking/tickets",
-            Ticket("lifecycle", null));
+            Ticket("lifecycle"));
         var heartbeat = await PostAsync<MatchTicketView>(
             activePlayer,
             $"/api/matchmaking/tickets/{ticket.TicketId:D}/heartbeat",
@@ -615,7 +746,7 @@ public sealed class PostgresApiWorkflowTests(PostgresDatabaseFixture database) :
         var expiring = await PostAsync<MatchTicketView>(
             expiringPlayer,
             "/api/matchmaking/tickets",
-            Ticket("expiring", null));
+            Ticket("expiring"));
         await using (var connection = new NpgsqlConnection(database.ConnectionString))
         {
             await connection.OpenAsync();
@@ -639,14 +770,267 @@ public sealed class PostgresApiWorkflowTests(PostgresDatabaseFixture database) :
         expired.Status.Should().Be(MatchTicketStatus.Expired);
     }
 
+    [Fact]
+    public async Task History_is_private_paginated_and_contains_switchable_safe_views()
+    {
+        using var first = await CreatePlayerAsync();
+        using var second = await CreatePlayerAsync();
+        using var outsider = await CreatePlayerAsync();
+        var firstGame = await CreateFinishedRoomGameAsync(first, second, makeMove: true);
+        var secondGame = await CreateFinishedRoomGameAsync(first, second, makeMove: false);
+
+        using var firstPageResponse = await first.GetAsync("/api/games/history?limit=1");
+        firstPageResponse.EnsureSuccessStatusCode();
+        firstPageResponse.Headers.CacheControl!.Private.Should().BeTrue();
+        firstPageResponse.Headers.CacheControl.NoStore.Should().BeTrue();
+        var firstPage = await ReadAsync<HistoricalGamesPageView>(firstPageResponse);
+        firstPage.Games.Should().ContainSingle();
+        firstPage.NextCursor.Should().NotBeNullOrWhiteSpace();
+        var secondPage = await GetAsync<HistoricalGamesPageView>(
+            first,
+            $"/api/games/history?limit=1&cursor={Uri.EscapeDataString(firstPage.NextCursor!)}");
+        firstPage.Games.Concat(secondPage.Games).Select(game => game.GameId)
+            .Should().BeEquivalentTo(new[] { firstGame.GameId, secondGame.GameId });
+        secondPage.NextCursor.Should().BeNull();
+
+        var losses = await GetAsync<HistoricalGamesPageView>(
+            first,
+            "/api/games/history?limit=20&result=loss&timeControl=untimed");
+        losses.Games.Should().HaveCount(2);
+        losses.Games.Should().OnlyContain(game =>
+            (game.CurrentPlayerSide == Side.Red ? game.Red.Outcome : game.Black.Outcome) == HistoricalOutcome.Loss);
+        (await GetAsync<HistoricalGamesPageView>(outsider, "/api/games/history"))
+            .Games.Should().BeEmpty();
+
+        using var firstReplayResponse = await first.GetAsync($"/api/games/{firstGame.GameId:D}/replay");
+        firstReplayResponse.EnsureSuccessStatusCode();
+        firstReplayResponse.Headers.CacheControl!.Private.Should().BeTrue();
+        firstReplayResponse.Headers.CacheControl.NoCache.Should().BeTrue();
+        firstReplayResponse.Headers.Vary.Should().Contain("Cookie");
+        var etag = firstReplayResponse.Headers.ETag!.Tag;
+        var firstReplayJson = await firstReplayResponse.Content.ReadAsStringAsync();
+        var firstReplay = JsonSerializer.Deserialize<HistoricalReplayView>(
+            firstReplayJson,
+            JsonOptions) ?? throw new InvalidOperationException("The replay response was empty.");
+        firstReplayJson.Should().NotContain("clientMoveId");
+        firstReplayJson.Should().NotContain("guestSessionId");
+        firstReplayJson.Should().NotContain("ownerPlayerId");
+        firstReplayJson.Should().NotContain("tokenHash");
+        firstReplayJson.Should().NotContain("roomCode");
+        using var compressedRequest = new HttpRequestMessage(
+            HttpMethod.Get,
+            $"/api/games/{firstGame.GameId:D}/replay");
+        compressedRequest.Headers.AcceptEncoding.ParseAdd("gzip");
+        using var compressedResponse = await first.SendAsync(compressedRequest);
+        compressedResponse.EnsureSuccessStatusCode();
+        compressedResponse.Content.Headers.ContentEncoding.Should().Contain("gzip");
+        var compressedBytes = await compressedResponse.Content.ReadAsByteArrayAsync();
+        compressedBytes.Length.Should().BeLessThan(Encoding.UTF8.GetByteCount(firstReplayJson));
+        var secondReplay = await GetAsync<HistoricalReplayView>(
+            second,
+            $"/api/games/{firstGame.GameId:D}/replay");
+        firstReplay.CurrentPlayerSide.Should().NotBe(secondReplay.CurrentPlayerSide);
+        firstReplay.Frames.Should().HaveCount(3);
+        var moveFrame = firstReplay.Frames[1];
+        moveFrame.Views.Omniscient.VisibleSquares.Should().HaveCount(90);
+        moveFrame.Views.Omniscient.Move.Should().NotBeNull();
+        var moverView = firstGame.MovedSide == Side.Red ? moveFrame.Views.Red : moveFrame.Views.Black;
+        var opponentView = firstGame.MovedSide == Side.Red ? moveFrame.Views.Black : moveFrame.Views.Red;
+        moverView.Move.Should().NotBeNull();
+        opponentView.Move.Should().BeNull();
+        moveFrame.Views.Red.Pieces.Count(piece => piece.Side == Side.Red).Should().Be(16);
+        moveFrame.Views.Black.Pieces.Count(piece => piece.Side == Side.Black).Should().Be(16);
+        moveFrame.Views.Red.VisibleSquares.Should().HaveCountLessThan(90);
+        moveFrame.Views.Black.VisibleSquares.Should().HaveCountLessThan(90);
+
+        using var conditionalRequest = new HttpRequestMessage(
+            HttpMethod.Get,
+            $"/api/games/{firstGame.GameId:D}/replay");
+        conditionalRequest.Headers.TryAddWithoutValidation("If-None-Match", etag);
+        using var unchanged = await first.SendAsync(conditionalRequest);
+        unchanged.StatusCode.Should().Be(HttpStatusCode.NotModified);
+
+        using var anonymous = _factory.CreateHttpsClient();
+        using var unauthorizedRequest = new HttpRequestMessage(
+            HttpMethod.Get,
+            $"/api/games/{firstGame.GameId:D}/replay");
+        unauthorizedRequest.Headers.TryAddWithoutValidation("If-None-Match", etag);
+        using var unauthorized = await anonymous.SendAsync(unauthorizedRequest);
+        unauthorized.StatusCode.Should().Be(HttpStatusCode.Unauthorized);
+        (await outsider.GetAsync($"/api/games/{firstGame.GameId:D}/replay"))
+            .StatusCode.Should().Be(HttpStatusCode.NotFound);
+    }
+
+    [Fact]
+    public async Task Replay_shares_rotate_revoke_independently_and_need_no_session()
+    {
+        using var first = await CreatePlayerAsync();
+        using var second = await CreatePlayerAsync();
+        using var outsider = await CreatePlayerAsync();
+        var game = await CreateFinishedRoomGameAsync(first, second, makeMove: false);
+        var firstShare = await PostAsync<ReplayShareCreatedView>(
+            first,
+            $"/api/games/{game.GameId:D}/replay-share",
+            body: null);
+        var firstToken = firstShare.SharePath[(firstShare.SharePath.LastIndexOf('/') + 1)..];
+        firstToken.Should().HaveLength(43);
+
+        using var anonymous = _factory.CreateHttpsClient();
+        using var sharedResponse = await anonymous.GetAsync($"/api/replay-shares/{firstToken}");
+        sharedResponse.EnsureSuccessStatusCode();
+        sharedResponse.Headers.CacheControl!.NoStore.Should().BeTrue();
+        (await ReadAsync<HistoricalReplayView>(sharedResponse)).CurrentPlayerSide.Should().BeNull();
+
+        var rotatedShare = await PostAsync<ReplayShareCreatedView>(
+            first,
+            $"/api/games/{game.GameId:D}/replay-share",
+            body: null);
+        var rotatedToken = rotatedShare.SharePath[(rotatedShare.SharePath.LastIndexOf('/') + 1)..];
+        rotatedToken.Should().NotBe(firstToken);
+        (await anonymous.GetAsync($"/api/replay-shares/{firstToken}"))
+            .StatusCode.Should().Be(HttpStatusCode.NotFound);
+        (await anonymous.GetAsync($"/api/replay-shares/{rotatedToken}"))
+            .StatusCode.Should().Be(HttpStatusCode.OK);
+
+        var secondShare = await PostAsync<ReplayShareCreatedView>(
+            second,
+            $"/api/games/{game.GameId:D}/replay-share",
+            body: null);
+        var secondToken = secondShare.SharePath[(secondShare.SharePath.LastIndexOf('/') + 1)..];
+        using var revoked = await first.DeleteAsync($"/api/games/{game.GameId:D}/replay-share");
+        revoked.StatusCode.Should().Be(HttpStatusCode.NoContent);
+        (await anonymous.GetAsync($"/api/replay-shares/{rotatedToken}"))
+            .StatusCode.Should().Be(HttpStatusCode.NotFound);
+        (await anonymous.GetAsync($"/api/replay-shares/{secondToken}"))
+            .StatusCode.Should().Be(HttpStatusCode.OK);
+        (await first.DeleteAsync($"/api/games/{game.GameId:D}/replay-share"))
+            .StatusCode.Should().Be(HttpStatusCode.NoContent);
+        (await PostResponseAsync(
+            outsider,
+            $"/api/games/{game.GameId:D}/replay-share",
+            body: null)).StatusCode.Should().Be(HttpStatusCode.NotFound);
+    }
+
+    [Fact]
+    public async Task Shared_replay_rate_limit_is_partitioned_by_token()
+    {
+        using var first = await CreatePlayerAsync();
+        using var second = await CreatePlayerAsync();
+        var game = await CreateFinishedRoomGameAsync(first, second, makeMove: false);
+        var share = await PostAsync<ReplayShareCreatedView>(
+            first,
+            $"/api/games/{game.GameId:D}/replay-share",
+            body: null);
+        var token = share.SharePath[(share.SharePath.LastIndexOf('/') + 1)..];
+        using var anonymous = _factory.CreateHttpsClient();
+
+        for (var requestNumber = 0; requestNumber < 60; requestNumber++)
+        {
+            using var allowed = await anonymous.GetAsync($"/api/replay-shares/{token}");
+            allowed.StatusCode.Should().Be(HttpStatusCode.OK);
+        }
+
+        using var rejected = await anonymous.GetAsync($"/api/replay-shares/{token}");
+        rejected.StatusCode.Should().Be(HttpStatusCode.TooManyRequests);
+        (await ReadAsync<ErrorResponse>(rejected)).Code.Should().Be("RATE_LIMITED");
+
+        var rotated = await PostAsync<ReplayShareCreatedView>(
+            first,
+            $"/api/games/{game.GameId:D}/replay-share",
+            body: null);
+        var rotatedToken = rotated.SharePath[(rotated.SharePath.LastIndexOf('/') + 1)..];
+        using var independent = await anonymous.GetAsync($"/api/replay-shares/{rotatedToken}");
+        independent.StatusCode.Should().Be(HttpStatusCode.OK);
+    }
+
+    [Fact]
+    public async Task History_query_uses_partial_player_indexes_with_realistic_volume()
+    {
+        using var targetRed = await CreatePlayerAsync();
+        using var targetBlack = await CreatePlayerAsync();
+        using var noiseRed = await CreatePlayerAsync();
+        using var noiseBlack = await CreatePlayerAsync();
+        var targetGame = await CreateFinishedRoomGameAsync(targetRed, targetBlack, makeMove: false);
+        var noiseGame = await CreateFinishedRoomGameAsync(noiseRed, noiseBlack, makeMove: false);
+
+        await using var connection = new NpgsqlConnection(database.ConnectionString);
+        await connection.OpenAsync();
+        var targetPlayerId = Guid.Empty;
+        await using (var playerCommand = new NpgsqlCommand(
+            "SELECT red_player_id FROM games WHERE id = @id",
+            connection))
+        {
+            playerCommand.Parameters.AddWithValue("id", targetGame.GameId);
+            targetPlayerId = (Guid)(await playerCommand.ExecuteScalarAsync()
+                ?? throw new InvalidOperationException("The target game was not persisted."));
+        }
+
+        const string insertSql =
+            """
+            INSERT INTO games
+                (id, red_player_id, black_player_id, initial_state, state, side_to_move,
+                 status, winner, result_reason, rule_version, time_control, is_rated,
+                 red_milliseconds, black_milliseconds, turn_started_at, clock_expires_at,
+                 version, created_at, updated_at, finished_at)
+            SELECT
+                gen_random_uuid(), source.red_player_id, source.black_player_id,
+                '{}'::jsonb, '{}'::jsonb, 'Red', 'Finished', 'Red', 'Resignation',
+                source.rule_version, NULL, FALSE, NULL, NULL, NULL, NULL, 0,
+                now() - (series.value * interval '1 second'),
+                now() - (series.value * interval '1 second'),
+                now() - (series.value * interval '1 second')
+            FROM games AS source
+            CROSS JOIN generate_series(1, @row_count) AS series(value)
+            WHERE source.id = @source_id
+            """;
+        await using (var targetInsert = new NpgsqlCommand(insertSql, connection))
+        {
+            targetInsert.Parameters.AddWithValue("row_count", 400);
+            targetInsert.Parameters.AddWithValue("source_id", targetGame.GameId);
+            (await targetInsert.ExecuteNonQueryAsync()).Should().Be(400);
+        }
+
+        await using (var noiseInsert = new NpgsqlCommand(insertSql, connection))
+        {
+            noiseInsert.Parameters.AddWithValue("row_count", 20_000);
+            noiseInsert.Parameters.AddWithValue("source_id", noiseGame.GameId);
+            (await noiseInsert.ExecuteNonQueryAsync()).Should().Be(20_000);
+        }
+
+        await using (var analyze = new NpgsqlCommand("ANALYZE games", connection))
+        {
+            await analyze.ExecuteNonQueryAsync();
+        }
+
+        await using var explain = new NpgsqlCommand(
+            """
+            EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
+            SELECT id, finished_at
+            FROM games
+            WHERE status = 'Finished'
+              AND (red_player_id = @player_id OR black_player_id = @player_id)
+            ORDER BY finished_at DESC, id DESC
+            LIMIT 21
+            """,
+            connection);
+        explain.Parameters.AddWithValue("player_id", targetPlayerId);
+        var plan = (string)(await explain.ExecuteScalarAsync()
+            ?? throw new InvalidOperationException("PostgreSQL did not return an execution plan."));
+
+        (plan.Contains("ix_games_history_red", StringComparison.Ordinal) ||
+         plan.Contains("ix_games_history_black", StringComparison.Ordinal))
+            .Should().BeTrue(plan);
+        plan.Should().NotContain("\"Node Type\": \"Seq Scan\"");
+    }
+
     public Task DisposeAsync()
     {
         _factory.Dispose();
         return Task.CompletedTask;
     }
 
-    private static CreateMatchTicketRequest Ticket(string requestId, string? timeControl) =>
-        new(GameState.CurrentRuleVersion, timeControl, requestId);
+    private static CreateMatchTicketRequest Ticket(string requestId) =>
+        new(GameState.CurrentRuleVersion, requestId);
 
     private async Task ExpireCurrentTurnAsync(Guid gameId)
     {
@@ -656,6 +1040,7 @@ public sealed class PostgresApiWorkflowTests(PostgresDatabaseFixture database) :
             """
             UPDATE games
             SET turn_started_at = now() - interval '5 seconds',
+                clock_expires_at = now() - interval '1 millisecond',
                 red_milliseconds = CASE WHEN side_to_move = 'Red' THEN 1 ELSE red_milliseconds END,
                 black_milliseconds = CASE WHEN side_to_move = 'Black' THEN 1 ELSE black_milliseconds END
             WHERE id = @id
@@ -695,6 +1080,48 @@ public sealed class PostgresApiWorkflowTests(PostgresDatabaseFixture database) :
         reader.GetString(5).Should().Be(GameStatus.Finished.ToString());
         reader.GetInt64(6).Should().Be(0);
         (await reader.ReadAsync()).Should().BeFalse();
+    }
+
+    private async Task<(Guid GameId, Side? MovedSide)> CreateFinishedRoomGameAsync(
+        HttpClient first,
+        HttpClient second,
+        bool makeMove)
+    {
+        var room = await PostAsync<RoomView>(
+            first,
+            "/api/rooms",
+            new CreateRoomRequest(GameState.CurrentRuleVersion, null));
+        await PostAsync<RoomView>(second, $"/api/rooms/{room.Code}/join", body: null);
+        await PostAsync<RoomView>(
+            first,
+            $"/api/rooms/{room.Code}/ready",
+            new SetReadyRequest(true));
+        var started = await PostAsync<RoomView>(
+            second,
+            $"/api/rooms/{room.Code}/ready",
+            new SetReadyRequest(true));
+        var gameId = started.GameId!.Value;
+        Side? movedSide = null;
+        if (makeMove)
+        {
+            var firstView = await GetAsync<ApiGameView>(first, $"/api/games/{gameId:D}");
+            var secondView = await GetAsync<ApiGameView>(second, $"/api/games/{gameId:D}");
+            var movingClient = firstView.Perspective == firstView.SideToMove ? first : second;
+            var movingView = firstView.Perspective == firstView.SideToMove ? firstView : secondView;
+            var candidate = movingView.CandidateMoves.First(move => move.Destinations.Count > 0);
+            await PostAsync<ApiGameView>(
+                movingClient,
+                $"/api/games/{gameId:D}/moves",
+                new MoveRequest(
+                    candidate.From,
+                    candidate.Destinations[0],
+                    movingView.Version,
+                    $"history-{gameId:N}"));
+            movedSide = movingView.SideToMove;
+        }
+
+        await PostAsync<ApiGameView>(first, $"/api/games/{gameId:D}/resign", body: null);
+        return (gameId, movedSide);
     }
 
     private async Task<HttpClient> CreatePlayerAsync()

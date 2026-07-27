@@ -31,9 +31,30 @@ public enum GameResultReason
     NoProgress
 }
 
-public sealed record GuestSessionView(Guid PlayerId, string DisplayName);
+public sealed record PlayerRatingView(
+    string RuleVersion,
+    string TimeControl,
+    int Rating,
+    int GamesPlayed);
+
+public sealed record GuestSessionView(
+    Guid PlayerId,
+    string DisplayName,
+    PlayerRatingView Rating);
 
 public sealed record AntiforgeryTokenView(string Token, string HeaderName);
+public sealed record TimeControlOptionView(
+    string Id,
+    string Label,
+    int InitialSeconds,
+    int IncrementSeconds);
+
+public sealed record GameOptionsView(
+    string RuleVersion,
+    TimeControlOptionView QuickMatchTimeControl,
+    IReadOnlyList<TimeControlOptionView> RoomTimeControls,
+    string DefaultRoomTimeControlId,
+    bool AllowUntimedRooms);
 
 public sealed record RoomPlayerView(string DisplayName, Side? Side, bool IsReady, bool IsCurrentPlayer);
 
@@ -53,7 +74,6 @@ public sealed record SetReadyRequest([property: JsonRequired] bool Ready);
 
 public sealed record CreateMatchTicketRequest(
     [Required, MaxLength(64)][property: JsonRequired] string RuleVersion,
-    [MaxLength(64)][property: JsonRequired] string? TimeControl,
     [Required, MinLength(1), MaxLength(64)][property: JsonRequired] string ClientRequestId);
 
 public sealed record MatchTicketView(
@@ -83,10 +103,12 @@ public sealed record CaptureSummaryView(
 public sealed record ClockView(long RedMilliseconds, long BlackMilliseconds, DateTimeOffset ServerTime);
 
 public sealed record GameResultView(Side? Winner, GameResultReason Reason);
+public sealed record RatingChangeView(int Before, int After, int Delta);
 
 public sealed record GameView(
     Guid GameId,
     string RuleVersion,
+    string? TimeControl,
     long Version,
     GameStatus Status,
     GameResultView? Result,
@@ -97,7 +119,8 @@ public sealed record GameView(
     IReadOnlyList<CandidateMoveView> CandidateMoves,
     CaptureSummaryView CaptureSummary,
     ClockView? Clock,
-    DrawOfferView? DrawOffer);
+    DrawOfferView? DrawOffer,
+    RatingChangeView? RatingChange);
 
 public sealed record MoveRequest(
     [Required][property: JsonRequired] Position From,
@@ -115,18 +138,63 @@ public sealed record ReplayMoveView(
     Position To,
     PieceType? Captured);
 
-public sealed record ReplayFrameView(
-    int Ply,
-    Side SideToMove,
+public enum HistoricalOutcome
+{
+    Win,
+    Loss,
+    Draw
+}
+
+public sealed record HistoricalPlayerView(
+    string DisplayName,
+    HistoricalOutcome Outcome,
+    int? RatingBefore);
+
+public sealed record HistoricalGameSummaryView(
+    Guid GameId,
+    DateTimeOffset FinishedAt,
+    string RuleVersion,
+    string? TimeControl,
+    Side CurrentPlayerSide,
+    HistoricalPlayerView Red,
+    HistoricalPlayerView Black,
+    GameResultView Result,
+    int PlyCount);
+
+public sealed record HistoricalGamesPageView(
+    IReadOnlyList<HistoricalGameSummaryView> Games,
+    string? NextCursor);
+
+public sealed record ReplayFrameProjectionView(
+    IReadOnlyList<Position> VisibleSquares,
     IReadOnlyList<PieceView> Pieces,
+    CaptureSummaryView CaptureSummary,
     ReplayMoveView? Move);
 
-public sealed record ReplayView(
+public sealed record ReplayFrameViewsView(
+    ReplayFrameProjectionView Red,
+    ReplayFrameProjectionView Black,
+    ReplayFrameProjectionView Omniscient);
+
+public sealed record HistoricalReplayFrameView(
+    int Ply,
+    Side SideToMove,
+    ClockView? Clock,
+    ReplayFrameViewsView Views);
+
+public sealed record HistoricalReplayView(
     Guid GameId,
     string RuleVersion,
-    Side Perspective,
+    string? TimeControl,
+    Side? CurrentPlayerSide,
+    HistoricalPlayerView Red,
+    HistoricalPlayerView Black,
     GameResultView Result,
-    IReadOnlyList<ReplayFrameView> Frames);
+    IReadOnlyList<HistoricalReplayFrameView> Frames);
+
+public sealed record ReplayShareCreatedView(
+    string SharePath,
+    DateTimeOffset CreatedAt);
 
 public sealed record ConnectionState(bool Connected);
 

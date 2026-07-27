@@ -1,4 +1,6 @@
 using System.Net;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
@@ -85,10 +87,14 @@ builder.Services.AddDbContextFactory<MistChessDbContext>(options =>
 builder.Services.AddSingleton<IGameStateSerializer, GameStateJsonSerializer>();
 builder.Services.AddSingleton<GameFactory>();
 builder.Services.AddSingleton<GameViewProjector>();
+builder.Services.AddSingleton<MistChessMetrics>();
+builder.Services.AddSingleton<RatingService>();
+builder.Services.AddSingleton<GameCompletionService>();
 builder.Services.AddScoped<GuestSessionService>();
 builder.Services.AddScoped<RoomService>();
 builder.Services.AddScoped<MatchmakingService>();
 builder.Services.AddScoped<GameService>();
+builder.Services.AddScoped<HistoryService>();
 builder.Services.AddSingleton<GameConnectionTracker>();
 builder.Services.AddSingleton<ILobbyNotifier, SignalRLobbyNotifier>();
 builder.Services.AddSingleton<IGameNotifier, SignalRGameNotifier>();
@@ -125,6 +131,7 @@ builder.Services.AddControllersWithViews()
     });
 builder.Services.AddSignalR()
     .AddJsonProtocol(options => ConfigureJson(options.PayloadSerializerOptions));
+builder.Services.AddResponseCompression(options => options.EnableForHttps = true);
 builder.Services.AddOpenApi(options =>
 {
     options.AddSchemaTransformer((schema, context, _) =>
@@ -159,6 +166,13 @@ builder.Services.AddRateLimiter(options =>
     options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
     options.OnRejected = async (context, cancellationToken) =>
     {
+        if (context.HttpContext.Request.Path.StartsWithSegments("/api/replay-shares"))
+        {
+            context.HttpContext.RequestServices
+                .GetRequiredService<MistChessMetrics>()
+                .RecordShareOperation("rate_limited");
+        }
+
         context.HttpContext.Response.ContentType = "application/json";
         await context.HttpContext.Response.WriteAsJsonAsync(
             new ErrorResponse("RATE_LIMITED", "Too many requests."),
@@ -171,6 +185,9 @@ builder.Services.AddRateLimiter(options =>
     options.AddPolicy("resource", context => FixedWindow(PlayerKey(context), 20, TimeSpan.FromMinutes(1)));
     options.AddPolicy("matchmaking", context => FixedWindow(PlayerKey(context), 12, TimeSpan.FromMinutes(1)));
     options.AddPolicy("command", context => FixedWindow(PlayerKey(context), 30, TimeSpan.FromMinutes(1)));
+    options.AddPolicy("history-read", context => FixedWindow(PlayerKey(context), 60, TimeSpan.FromMinutes(1)));
+    options.AddPolicy("share-change", context => FixedWindow(PlayerKey(context), 10, TimeSpan.FromMinutes(1)));
+    options.AddPolicy("share-read", context => FixedWindow(ShareReadKey(context), 60, TimeSpan.FromMinutes(1)));
     options.AddPolicy("move", context => FixedWindow(
         PlayerKey(context),
         20,
@@ -183,6 +200,9 @@ var hasStaticWebApp = Directory.Exists(app.Environment.WebRootPath)
     && File.Exists(Path.Combine(app.Environment.WebRootPath, "index.html"));
 app.UseForwardedHeaders();
 app.UseWebSockets();
+app.UseMiddleware<CompressedReplayResponseSizeMiddleware>();
+app.UseResponseCompression();
+app.UseMiddleware<UncompressedReplayResponseSizeMiddleware>();
 app.Use(async (context, next) =>
 {
     if ((context.Request.Path.StartsWithSegments("/hubs/lobby") ||
@@ -196,6 +216,11 @@ app.Use(async (context, next) =>
             context.Response.StatusCode = StatusCodes.Status403Forbidden;
             return;
         }
+    }
+
+    if (context.Request.Path.StartsWithSegments("/shared/replay"))
+    {
+        context.Response.Headers["Referrer-Policy"] = "no-referrer";
     }
 
     await next(context);
@@ -274,5 +299,16 @@ static string PlayerKey(HttpContext context) =>
     CurrentPlayer.TryGetId(context.User)?.ToString("N")
     ?? context.Connection.RemoteIpAddress?.ToString()
     ?? "anonymous";
+
+static string ShareReadKey(HttpContext context)
+{
+    var remoteAddress = context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+    var token = context.Request.RouteValues.TryGetValue("shareToken", out var value)
+        ? value?.ToString() ?? string.Empty
+        : string.Empty;
+    var digest = Convert.ToHexString(
+        SHA256.HashData(Encoding.UTF8.GetBytes(token))).AsSpan(0, 16).ToString();
+    return $"{remoteAddress}:{digest}";
+}
 
 public partial class Program;

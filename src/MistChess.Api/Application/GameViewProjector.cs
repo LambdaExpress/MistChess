@@ -16,10 +16,12 @@ public sealed class GameViewProjector(IGameStateSerializer stateSerializer, Time
         return ProjectCore(
             game.Id,
             game.RuleVersion,
+            game.TimeControl,
             game.Version,
             game.Status,
             game.Winner,
             game.ResultReason,
+            game.RatingSettlement,
             game.RedMilliseconds,
             game.BlackMilliseconds,
             game.TurnStartedAt,
@@ -36,10 +38,12 @@ public sealed class GameViewProjector(IGameStateSerializer stateSerializer, Time
         return ProjectCore(
             game.Id,
             game.RuleVersion,
+            game.TimeControl,
             move.GameVersion,
             status,
             move.WinnerAfter,
             move.ResultReasonAfter,
+            game.RatingSettlement,
             move.RedMillisecondsAfter,
             move.BlackMillisecondsAfter,
             move.TurnStartedAtAfter,
@@ -58,10 +62,12 @@ public sealed class GameViewProjector(IGameStateSerializer stateSerializer, Time
         return ProjectCore(
             game.Id,
             game.RuleVersion,
+            game.TimeControl,
             receipt.GameVersion,
             status,
             receipt.WinnerAfter,
             receipt.ResultReasonAfter,
+            game.RatingSettlement,
             receipt.RedMillisecondsAfter,
             receipt.BlackMillisecondsAfter,
             receipt.TurnStartedAtAfter,
@@ -76,6 +82,41 @@ public sealed class GameViewProjector(IGameStateSerializer stateSerializer, Time
         .OrderBy(value => (value.Position.Rank * GameState.BoardFiles) + value.Position.File)
         .Select(value => new PieceView(value.Piece.Side, value.Piece.Type, ToApi(value.Position)))
         .ToArray();
+
+    public ReplayFrameProjectionView ProjectReplayFrame(
+        GameState state,
+        Side? perspective,
+        ReplayMoveView? move)
+    {
+        var visibility = perspective is null
+            ? Enumerable.Range(0, GameState.BoardSize)
+                .Select(index => new MistChess.Domain.Position(
+                    index % GameState.BoardFiles,
+                    index / GameState.BoardFiles))
+                .ToHashSet()
+            : PlayerProjection.ComputeVisibility(state, perspective.Value);
+        var pieces = state.Pieces
+            .Where(value =>
+                perspective is null ||
+                value.Piece.Side == perspective.Value ||
+                visibility.Contains(value.Position))
+            .OrderBy(value => (value.Position.Rank * GameState.BoardFiles) + value.Position.File)
+            .Select(value => new PieceView(
+                value.Piece.Side,
+                value.Piece.Type,
+                ToApi(value.Position)))
+            .ToArray();
+        return new ReplayFrameProjectionView(
+            visibility
+                .OrderBy(value => (value.Rank * GameState.BoardFiles) + value.File)
+                .Select(ToApi)
+                .ToArray(),
+            pieces,
+            new CaptureSummaryView(
+                state.RedLostPieces.ToArray(),
+                state.BlackLostPieces.ToArray()),
+            move);
+    }
 
     public static GameResultView MapResult(GameEntity game)
     {
@@ -113,10 +154,12 @@ public sealed class GameViewProjector(IGameStateSerializer stateSerializer, Time
     private static ApiGameView ProjectCore(
         Guid gameId,
         string ruleVersion,
+        string? timeControl,
         long version,
         GameStatus status,
         Side? winner,
         string? resultReason,
+        RatingSettlementEntity? ratingSettlement,
         long? redMilliseconds,
         long? blackMilliseconds,
         DateTimeOffset? turnStartedAt,
@@ -140,7 +183,19 @@ public sealed class GameViewProjector(IGameStateSerializer stateSerializer, Time
             state.SideToMove,
             status,
             now);
-        return ToApiView(gameId, version, status, result, domainProjection, clock, drawOffer);
+        var ratingChange = status == GameStatus.Finished
+            ? MapRatingChange(ratingSettlement, perspective)
+            : null;
+        return ToApiView(
+            gameId,
+            timeControl,
+            version,
+            status,
+            result,
+            domainProjection,
+            clock,
+            drawOffer,
+            ratingChange);
     }
 
     private static GameState PrepareProjectionState(
@@ -164,16 +219,19 @@ public sealed class GameViewProjector(IGameStateSerializer stateSerializer, Time
 
     private static ApiGameView ToApiView(
         Guid gameId,
+        string? timeControl,
         long version,
         GameStatus status,
         GameResultView? result,
         DomainGameView projection,
         ClockView? clock,
-        DrawOfferView? drawOffer)
+        DrawOfferView? drawOffer,
+        RatingChangeView? ratingChange)
     {
         return new ApiGameView(
             gameId,
             projection.RuleVersion,
+            timeControl,
             version,
             status,
             result,
@@ -188,9 +246,28 @@ public sealed class GameViewProjector(IGameStateSerializer stateSerializer, Time
                 projection.CaptureSummary.RedLost.ToArray(),
                 projection.CaptureSummary.BlackLost.ToArray()),
             clock,
-            status == GameStatus.Playing ? drawOffer : null);
+            status == GameStatus.Playing ? drawOffer : null,
+            ratingChange);
     }
 
+
+    private static RatingChangeView? MapRatingChange(
+        RatingSettlementEntity? settlement,
+        Side perspective)
+    {
+        if (settlement is null)
+        {
+            return null;
+        }
+
+        var before = perspective == Side.Red
+            ? settlement.RedRatingBefore
+            : settlement.BlackRatingBefore;
+        var after = perspective == Side.Red
+            ? settlement.RedRatingAfter
+            : settlement.BlackRatingAfter;
+        return new RatingChangeView(before, after, after - before);
+    }
     private static ClockView? ComputeClock(
         long? redMilliseconds,
         long? blackMilliseconds,

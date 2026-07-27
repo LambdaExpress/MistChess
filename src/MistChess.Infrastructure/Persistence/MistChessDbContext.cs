@@ -15,6 +15,9 @@ public sealed class MistChessDbContext(DbContextOptions<MistChessDbContext> opti
     public DbSet<MoveEntity> Moves => Set<MoveEntity>();
     public DbSet<MoveCommandReceiptEntity> MoveCommandReceipts => Set<MoveCommandReceiptEntity>();
     public DbSet<DrawOfferEntity> DrawOffers => Set<DrawOfferEntity>();
+    public DbSet<PlayerRatingEntity> PlayerRatings => Set<PlayerRatingEntity>();
+    public DbSet<RatingSettlementEntity> RatingSettlements => Set<RatingSettlementEntity>();
+    public DbSet<ReplayShareEntity> ReplayShares => Set<ReplayShareEntity>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -27,6 +30,9 @@ public sealed class MistChessDbContext(DbContextOptions<MistChessDbContext> opti
         ConfigureMoves(modelBuilder);
         ConfigureMoveCommandReceipts(modelBuilder);
         ConfigureDrawOffers(modelBuilder);
+        ConfigurePlayerRatings(modelBuilder);
+        ConfigureRatingSettlements(modelBuilder);
+        ConfigureReplayShares(modelBuilder);
     }
 
     private static void ConfigureGuestSessions(ModelBuilder modelBuilder)
@@ -92,12 +98,15 @@ public sealed class MistChessDbContext(DbContextOptions<MistChessDbContext> opti
             table.HasCheckConstraint("ck_matchmaking_tickets_expiry", "expires_at > created_at AND expires_at >= last_heartbeat_at");
             table.HasCheckConstraint("ck_matchmaking_tickets_status", "status IN ('Searching', 'Matched', 'Cancelled', 'Expired')");
             table.HasCheckConstraint("ck_matchmaking_tickets_game", "(status = 'Matched' AND game_id IS NOT NULL) OR (status <> 'Matched' AND game_id IS NULL)");
+            table.HasCheckConstraint("ck_matchmaking_tickets_rating_snapshot", "rating_snapshot >= 100");
+            table.HasCheckConstraint("ck_matchmaking_tickets_time_control", "status <> 'Searching' OR time_control = '600+5'");
         });
         entity.HasKey(value => value.Id);
         entity.Property(value => value.Id).HasColumnName("id");
         entity.Property(value => value.PlayerId).HasColumnName("player_id");
         entity.Property(value => value.RuleVersion).HasColumnName("rule_version").HasMaxLength(64).IsRequired();
         entity.Property(value => value.TimeControl).HasColumnName("time_control").HasMaxLength(64);
+        entity.Property(value => value.RatingSnapshot).HasColumnName("rating_snapshot");
         entity.Property(value => value.Status).HasColumnName("status").HasConversion<string>().HasMaxLength(16);
         entity.Property(value => value.CreatedAt).HasColumnName("created_at");
         entity.Property(value => value.LastHeartbeatAt).HasColumnName("last_heartbeat_at");
@@ -122,6 +131,8 @@ public sealed class MistChessDbContext(DbContextOptions<MistChessDbContext> opti
             table.HasCheckConstraint("ck_games_status", "status IN ('Playing', 'Finished')");
             table.HasCheckConstraint("ck_games_result", "(status = 'Finished' AND result_reason IS NOT NULL AND finished_at IS NOT NULL) OR (status = 'Playing' AND result_reason IS NULL AND winner IS NULL AND finished_at IS NULL)");
             table.HasCheckConstraint("ck_games_clock", "(time_control IS NULL AND red_milliseconds IS NULL AND black_milliseconds IS NULL AND turn_started_at IS NULL) OR (time_control IS NOT NULL AND red_milliseconds >= 0 AND black_milliseconds >= 0)");
+            table.HasCheckConstraint("ck_games_rated_time_control", "NOT is_rated OR time_control = '600+5'");
+            table.HasCheckConstraint("ck_games_clock_expiry", "(time_control IS NULL AND clock_expires_at IS NULL) OR (time_control IS NOT NULL AND ((status = 'Playing' AND clock_expires_at IS NOT NULL) OR (status = 'Finished' AND clock_expires_at IS NULL)))");
         });
         entity.HasKey(value => value.Id);
         entity.Property(value => value.Id).HasColumnName("id");
@@ -135,9 +146,11 @@ public sealed class MistChessDbContext(DbContextOptions<MistChessDbContext> opti
         entity.Property(value => value.ResultReason).HasColumnName("result_reason").HasMaxLength(32);
         entity.Property(value => value.RuleVersion).HasColumnName("rule_version").HasMaxLength(64).IsRequired();
         entity.Property(value => value.TimeControl).HasColumnName("time_control").HasMaxLength(64);
+        entity.Property(value => value.IsRated).HasColumnName("is_rated");
         entity.Property(value => value.RedMilliseconds).HasColumnName("red_milliseconds");
         entity.Property(value => value.BlackMilliseconds).HasColumnName("black_milliseconds");
         entity.Property(value => value.TurnStartedAt).HasColumnName("turn_started_at");
+        entity.Property(value => value.ClockExpiresAt).HasColumnName("clock_expires_at");
         entity.Property(value => value.Version).HasColumnName("version").IsConcurrencyToken();
         entity.Property(value => value.CreatedAt).HasColumnName("created_at");
         entity.Property(value => value.UpdatedAt).HasColumnName("updated_at");
@@ -145,6 +158,17 @@ public sealed class MistChessDbContext(DbContextOptions<MistChessDbContext> opti
         entity.HasIndex(value => value.RedPlayerId).HasFilter("\"status\" <> 'Finished'").HasDatabaseName("ix_games_active_red_player");
         entity.HasIndex(value => value.BlackPlayerId).HasFilter("\"status\" <> 'Finished'").HasDatabaseName("ix_games_active_black_player");
         entity.HasIndex(value => new { value.Status, value.TurnStartedAt }).HasDatabaseName("ix_games_active_clock");
+        entity.HasIndex(value => new { value.RedPlayerId, value.FinishedAt, value.Id })
+            .IsDescending(false, true, true)
+            .HasFilter("\"status\" = 'Finished'")
+            .HasDatabaseName("ix_games_history_red");
+        entity.HasIndex(value => new { value.BlackPlayerId, value.FinishedAt, value.Id })
+            .IsDescending(false, true, true)
+            .HasFilter("\"status\" = 'Finished'")
+            .HasDatabaseName("ix_games_history_black");
+        entity.HasIndex(value => new { value.ClockExpiresAt, value.Id })
+            .HasFilter("\"status\" = 'Playing' AND \"clock_expires_at\" IS NOT NULL")
+            .HasDatabaseName("ix_games_expired_clock");
         entity.HasOne(value => value.RedPlayer).WithMany().HasForeignKey(value => value.RedPlayerId).OnDelete(DeleteBehavior.Restrict);
         entity.HasOne(value => value.BlackPlayer).WithMany().HasForeignKey(value => value.BlackPlayerId).OnDelete(DeleteBehavior.Restrict);
     }
@@ -244,6 +268,76 @@ public sealed class MistChessDbContext(DbContextOptions<MistChessDbContext> opti
         entity.HasIndex(value => value.GameId).IsUnique().HasFilter("\"status\" = 'Pending'").HasDatabaseName("ux_draw_offers_pending_game");
         entity.HasOne(value => value.Game).WithMany(value => value.DrawOffers).HasForeignKey(value => value.GameId).OnDelete(DeleteBehavior.Cascade);
         entity.HasOne(value => value.OfferedByPlayer).WithMany().HasForeignKey(value => value.OfferedByPlayerId).OnDelete(DeleteBehavior.Restrict);
+    }
+
+    private static void ConfigurePlayerRatings(ModelBuilder modelBuilder)
+    {
+        var entity = modelBuilder.Entity<PlayerRatingEntity>();
+        entity.ToTable("player_ratings", table =>
+        {
+            table.HasCheckConstraint("ck_player_ratings_rating", "rating >= 100");
+            table.HasCheckConstraint("ck_player_ratings_statistics", "games_played >= 0 AND wins >= 0 AND draws >= 0 AND losses >= 0 AND games_played = wins + draws + losses");
+            table.HasCheckConstraint("ck_player_ratings_time_control", "time_control = '600+5'");
+        });
+        entity.HasKey(value => new { value.PlayerId, value.RuleVersion, value.TimeControl });
+        entity.Property(value => value.PlayerId).HasColumnName("player_id");
+        entity.Property(value => value.RuleVersion).HasColumnName("rule_version").HasMaxLength(64);
+        entity.Property(value => value.TimeControl).HasColumnName("time_control").HasMaxLength(64);
+        entity.Property(value => value.Rating).HasColumnName("rating").HasDefaultValue(1500);
+        entity.Property(value => value.GamesPlayed).HasColumnName("games_played");
+        entity.Property(value => value.Wins).HasColumnName("wins");
+        entity.Property(value => value.Draws).HasColumnName("draws");
+        entity.Property(value => value.Losses).HasColumnName("losses");
+        entity.Property(value => value.UpdatedAt).HasColumnName("updated_at");
+        entity.Property(value => value.ConcurrencyStamp).HasColumnName("concurrency_stamp").IsConcurrencyToken();
+        entity.HasOne(value => value.Player).WithMany().HasForeignKey(value => value.PlayerId).OnDelete(DeleteBehavior.Restrict);
+    }
+
+    private static void ConfigureRatingSettlements(ModelBuilder modelBuilder)
+    {
+        var entity = modelBuilder.Entity<RatingSettlementEntity>();
+        entity.ToTable("rating_settlements", table =>
+        {
+            table.HasCheckConstraint("ck_rating_settlements_ratings", "red_rating_before >= 100 AND red_rating_after >= 100 AND black_rating_before >= 100 AND black_rating_after >= 100");
+            table.HasCheckConstraint("ck_rating_settlements_score", "red_score IN (0.0, 0.5, 1.0)");
+        });
+        entity.HasKey(value => value.GameId);
+        entity.Property(value => value.GameId).HasColumnName("game_id");
+        entity.Property(value => value.RedRatingBefore).HasColumnName("red_rating_before");
+        entity.Property(value => value.RedRatingAfter).HasColumnName("red_rating_after");
+        entity.Property(value => value.BlackRatingBefore).HasColumnName("black_rating_before");
+        entity.Property(value => value.BlackRatingAfter).HasColumnName("black_rating_after");
+        entity.Property(value => value.RedScore).HasColumnName("red_score").HasPrecision(2, 1);
+        entity.Property(value => value.SettledAt).HasColumnName("settled_at");
+        entity.HasOne(value => value.Game).WithOne(value => value.RatingSettlement)
+            .HasForeignKey<RatingSettlementEntity>(value => value.GameId)
+            .OnDelete(DeleteBehavior.Cascade);
+    }
+
+    private static void ConfigureReplayShares(ModelBuilder modelBuilder)
+    {
+        var entity = modelBuilder.Entity<ReplayShareEntity>();
+        entity.ToTable("replay_shares", table => table.HasCheckConstraint(
+            "ck_replay_shares_revocation",
+            "revoked_at IS NULL OR revoked_at >= created_at"));
+        entity.HasKey(value => value.Id);
+        entity.Property(value => value.Id).HasColumnName("id");
+        entity.Property(value => value.GameId).HasColumnName("game_id");
+        entity.Property(value => value.OwnerPlayerId).HasColumnName("owner_player_id");
+        entity.Property(value => value.TokenHash).HasColumnName("token_hash").HasMaxLength(64).IsFixedLength();
+        entity.Property(value => value.CreatedAt).HasColumnName("created_at");
+        entity.Property(value => value.RevokedAt).HasColumnName("revoked_at");
+        entity.HasIndex(value => value.TokenHash).IsUnique().HasDatabaseName("ux_replay_shares_token_hash");
+        entity.HasIndex(value => new { value.GameId, value.OwnerPlayerId })
+            .IsUnique()
+            .HasFilter("\"revoked_at\" IS NULL")
+            .HasDatabaseName("ux_replay_shares_active_owner");
+        entity.HasOne(value => value.Game).WithMany(value => value.ReplayShares)
+            .HasForeignKey(value => value.GameId)
+            .OnDelete(DeleteBehavior.Cascade);
+        entity.HasOne(value => value.OwnerPlayer).WithMany()
+            .HasForeignKey(value => value.OwnerPlayerId)
+            .OnDelete(DeleteBehavior.Restrict);
     }
 }
 
