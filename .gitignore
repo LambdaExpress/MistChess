@@ -53,7 +53,7 @@ appsettings.*.Local.json
 *.key
 
 # Local development notes
-DEVELOPMENT.md
+DEVELOPMENT*.md
 
 # Logs and temporary files
 *.log

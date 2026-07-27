@@ -4,7 +4,10 @@ param(
     [switch]$NoBrowser,
 
     [ValidateRange(5, 300)]
-    [int]$StartupTimeoutSeconds = 60
+    [int]$StartupTimeoutSeconds = 60,
+
+    [switch]$ListenOnLan,
+    [string]$WebHost
 )
 
 Set-StrictMode -Version Latest
@@ -17,8 +20,8 @@ $webNodeModules = Join-Path $webDirectory 'node_modules'
 $environmentFile = Join-Path $repoRoot '.env'
 $databaseInitializer = Join-Path $repoRoot 'scripts/database/Initialize-LocalPostgres.ps1'
 $infrastructureProject = Join-Path $repoRoot 'src/MistChess.Infrastructure/MistChess.Infrastructure.csproj'
-$apiUrl = 'http://127.0.0.1:5052'
-$webUrl = 'http://127.0.0.1:5173'
+$apiUrl = 'http://localhost:5052'
+$webUrl = $null
 
 function Get-RequiredCommand {
     param(
@@ -202,6 +205,48 @@ function Test-TcpPort {
     }
 }
 
+function Get-PreferredLanAddress {
+    $candidates = foreach ($configuration in Get-NetIPConfiguration) {
+        if ($configuration.NetAdapter.Status -ne 'Up' -or
+            -not $configuration.NetAdapter.HardwareInterface -or
+            $null -eq $configuration.IPv4DefaultGateway) {
+            continue
+        }
+
+        $ipInterface = Get-NetIPInterface `
+            -InterfaceIndex $configuration.InterfaceIndex `
+            -AddressFamily IPv4 `
+            -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        foreach ($address in @($configuration.IPv4Address)) {
+            if ([string]::IsNullOrWhiteSpace($address.IPAddress)) {
+                continue
+            }
+
+            [pscustomobject]@{
+                IPAddress = $address.IPAddress
+                InterfaceAlias = $configuration.InterfaceAlias
+                InterfaceIndex = $configuration.InterfaceIndex
+                InterfaceMetric = if ($null -eq $ipInterface) {
+                    [int]::MaxValue
+                }
+                else {
+                    $ipInterface.InterfaceMetric
+                }
+            }
+        }
+    }
+
+    $selected = $candidates |
+        Sort-Object InterfaceMetric, InterfaceAlias |
+        Select-Object -First 1
+    if ($null -eq $selected) {
+        throw '未找到带默认网关的活动物理网卡。请连接局域网，或使用 -WebHost 指定当前电脑的 IPv4 地址。'
+    }
+
+    return $selected
+}
+
 function ConvertTo-EncodedCommand {
     param(
         [Parameter(Mandatory)]
@@ -263,6 +308,39 @@ function Wait-ForHttpEndpoint {
 }
 
 try {
+    $selectedLan = $null
+    if ([string]::IsNullOrWhiteSpace($WebHost)) {
+        if ($ListenOnLan) {
+            $selectedLan = Get-PreferredLanAddress
+            $WebHost = $selectedLan.IPAddress
+            Write-Host "已自动选择局域网地址：$WebHost（$($selectedLan.InterfaceAlias)）" -ForegroundColor Cyan
+        }
+        else {
+            $WebHost = '127.0.0.1'
+        }
+    }
+
+    $webUrl = "http://${WebHost}:5173"
+    $webHostAddress = $null
+    if (-not [System.Net.IPAddress]::TryParse($WebHost, [ref]$webHostAddress) -or
+        $webHostAddress.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork -or
+        $webHostAddress.Equals([System.Net.IPAddress]::Any)) {
+        throw "WebHost 必须是本机明确的 IPv4 地址，不能使用主机名或 0.0.0.0：$WebHost"
+    }
+
+    if (-not [System.Net.IPAddress]::IsLoopback($webHostAddress)) {
+        $isLocalAddress = [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() |
+            ForEach-Object { $_.GetIPProperties().UnicastAddresses.Address } |
+            Where-Object { $_.Equals($webHostAddress) } |
+            Select-Object -First 1
+        if ($null -eq $isLocalAddress) {
+            throw "WebHost 不是当前电脑的 IPv4 地址：$WebHost"
+        }
+
+        Write-Host "局域网监听已启用：$webUrl" -ForegroundColor Yellow
+        Write-Host '请只在受信任网络使用；若其他设备无法连接，请将当前网络设为“专用”，并允许 node.exe 通过 Windows Defender 防火墙的 TCP 5173 入站。' -ForegroundColor Yellow
+    }
+
     $Host.UI.RawUI.WindowTitle = 'MistChess Launcher'
     Set-Location -LiteralPath $repoRoot
 
@@ -295,11 +373,11 @@ try {
         }
     }
 
-    if (Test-TcpPort -HostName '127.0.0.1' -Port 5052) {
+    if (Test-TcpPort -HostName 'localhost' -Port 5052) {
         throw '端口 5052 已被占用。请先关闭已有 API 或占用该端口的程序。'
     }
 
-    if (Test-TcpPort -HostName '127.0.0.1' -Port 5173) {
+    if (Test-TcpPort -HostName $WebHost -Port 5173) {
         throw '端口 5173 已被占用。请先关闭已有前端服务或占用该端口的程序。'
     }
 
@@ -345,9 +423,14 @@ try {
     }
 
     $escapedRepoRoot = $repoRoot.Replace("'", "''")
+    $escapedWebUrl = $webUrl.Replace("'", "''")
+    $escapedWebHost = $WebHost.Replace("'", "''")
     $apiCommand = @"
 `$Host.UI.RawUI.WindowTitle = 'MistChess API'
 Set-Location -LiteralPath '$escapedRepoRoot'
+`$env:WebSockets__AllowedOrigins__0 = '$escapedWebUrl'
+`$env:WebSockets__AllowedOrigins__1 = 'http://127.0.0.1:5173'
+`$env:WebSockets__AllowedOrigins__2 = 'http://localhost:5173'
 dotnet run --project 'src/MistChess.Api/MistChess.Api.csproj' --launch-profile http
 if (`$LASTEXITCODE -ne 0) {
     Write-Host "API 已退出，退出码：`$LASTEXITCODE" -ForegroundColor Red
@@ -356,7 +439,7 @@ if (`$LASTEXITCODE -ne 0) {
     $webCommand = @"
 `$Host.UI.RawUI.WindowTitle = 'MistChess Web'
 Set-Location -LiteralPath '$escapedRepoRoot'
-npm.cmd run dev --prefix apps/web -- --host 127.0.0.1 --port 5173
+npm.cmd run dev --prefix apps/web -- --host '$escapedWebHost' --port 5173
 if (`$LASTEXITCODE -ne 0) {
     Write-Host "前端已退出，退出码：`$LASTEXITCODE" -ForegroundColor Red
 }

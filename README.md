@@ -1,6 +1,6 @@
 # MistChess
 
-中国迷雾象棋首版，后端使用 .NET 10，前端使用 React 19 与 Vite，开发数据库使用 PostgreSQL 18。
+中国迷雾象棋，后端使用 .NET 10，前端使用 React 19 与 Vite，开发数据库使用 PostgreSQL 18。第二阶段包含 `600+5` 动态 Elo 匹配、连续棋钟、音效、游客私有历史、三视野回放和可撤销分享链接。
 
 ## 准备环境
 
@@ -12,13 +12,23 @@
 
 运行仓库根目录的 `Start-MistChess.ps1`。脚本会检查开发工具、安装缺失的前端依赖，并应用待执行的 EF Core migrations。首次运行或 `.env` 密码与数据库角色不一致时，脚本会在当前窗口安全询问 PostgreSQL 管理员密码，然后创建或更新 `mistchess_app`、创建 `mistchess_dev` 并同步 `.env` 中的应用密码。输入的管理员密码不会显示。
 
-随后脚本会在两个独立的 PowerShell 窗口中启动 API 与前端，确认数据库和两个服务就绪后打开 `http://127.0.0.1:5173`。
+随后脚本会在两个独立的 PowerShell 窗口中启动 API 与前端，确认数据库和两个服务就绪后打开站点。默认仅监听 `http://127.0.0.1:5173`。
 
 如果 Windows 已将 `.ps1` 文件关联为 PowerShell 执行，可以直接双击脚本。Windows 默认文件关联可能会用编辑器打开 `.ps1`，此时请右键脚本并选择“使用 PowerShell 运行”，或在仓库根目录执行：
 
 ```powershell
 pwsh -NoProfile -ExecutionPolicy Bypass -File .\Start-MistChess.ps1
 ```
+
+需要让同一局域网内的其他设备访问时，使用：
+
+```powershell
+.\Start-MistChess.ps1 -ListenOnLan
+```
+
+脚本每次启动都会从带 IPv4 默认网关的活动物理网卡中选择当前地址，并用该地址启动前端，不会保存或依赖固定局域网 IP。多网卡环境中如果自动选择结果不符合预期，可以用 `-WebHost` 显式传入本机当前的 IPv4 地址。
+
+局域网模式只将 Vite 前端暴露在 TCP 5173；API 和数据库仍保持本机监听，浏览器请求由 Vite 同源代理转发。请仅在受信任网络中使用，并将 Windows 网络配置文件设为“专用”。其他设备仍无法连接时，允许 `node.exe` 通过 Windows Defender 防火墙的 TCP 5173 入站。
 
 停止服务时，分别在 `MistChess API` 和 `MistChess Web` 窗口中按 `Ctrl+C`，然后关闭窗口。
 
@@ -122,3 +132,26 @@ $env:ReverseProxy__KnownProxies__0 = "<proxy-ip-address>"
 ```
 
 生产入口必须使用 HTTPS。发布进程同源提供前端静态资源、`/api` 与 `/hubs`；存活和数据库就绪检查分别位于 `/health/live` 与 `/health/ready`。
+
+## 生产监控
+
+API 通过 `System.Diagnostics.Metrics` 发布名为 `MistChess.Api` 的 Meter。生产宿主可以使用 .NET 诊断工具或 OpenTelemetry Meter Provider 采集；应用指标只使用结果、人口档位、计时配置等低基数标签，不包含玩家 ID、棋局 ID、Cookie、令牌哈希或分享令牌。
+
+核心仪表：
+
+- `mistchess.matchmaking.tickets` 与 `mistchess.matchmaking.ticket.duration`：票据创建、成局、取消、过期及等待时长。
+- `mistchess.matchmaking.scans`、`mistchess.matchmaking.eligible_population` 和 `mistchess.matchmaking.waiting.duration`：扫描时的有效人口、人口档位、是否不限分差和锚点等待时长。
+- `mistchess.matchmaking.matches`、`mistchess.matchmaking.rating.difference` 和 `mistchess.matchmaking.match.duration`：各人口档位成局数、实际评分差和成局耗时。
+- `mistchess.clock.timeouts`、`mistchess.clock.scan.delay` 和 `mistchess.clock.duplicate_completion_conflicts`：后台超时完成、扫描延迟和重复结束冲突。
+- `mistchess.game.completions`、`mistchess.game.completion.duration`、`mistchess.rating.settlements` 和 `mistchess.rating.change`：终局原因、结算耗时、评分幂等命中和双方评分变化。
+- `mistchess.history.list.duration`、`mistchess.replay.build.duration`、`mistchess.replay.frames`、`mistchess.replay.response.size` 和 `mistchess.replay.cache.validations`：历史查询、回放重建、压缩前后大小和 ETag 命中。
+- `mistchess.share.operations`：分享创建、撤销、有效读取、无效读取和令牌限流。
+
+建议仪表盘至少聚合以下发布指标：
+
+1. `matchmaking.ticket.duration` 的成局 P50、P95，以及 `matched` 的 60 秒累计桶相对 `created` 计数得到的 60 秒内成局率。
+2. `matchmaking.matches` 按 `population_band` 和 `unrestricted` 分组的成局数；同组 `rating.difference` 的平均值和 P95。
+3. `clock.scan.delay` 的 P95 和 `duplicate_completion_conflicts` 增量。
+4. `replay.build.duration`、`replay.response.size` 的 P95，`replay.cache.validations` 的命中率，以及 `share.operations` 中无效读取和限流占比。
+
+默认匹配阈值已经由边界测试固定：有效人口 `2–4` 首轮不限分差；`5–9`、`10–19`、`20–49`、`50+` 的基础范围分别为 400、250、150、100；等待 15、30、45 秒增加 100、200、400，达到 60 秒不限分差。调整阈值前应对照上述分组指标，并重新运行 `Phase2PolicyTests` 和 PostgreSQL 匹配工作流测试。
