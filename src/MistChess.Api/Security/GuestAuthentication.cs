@@ -52,13 +52,48 @@ public sealed class GuestAuthenticationHandler(
             return AuthenticateResult.Fail("The guest session is invalid or expired.");
         }
 
-        var claims = new[]
+        var claims = new List<Claim>
         {
-            new Claim(ClaimTypes.NameIdentifier, session.Id.ToString("D")),
-            new Claim(ClaimTypes.Name, session.DisplayName)
+            new(ClaimTypes.NameIdentifier, session.Id.ToString("D")),
+            new(ClaimTypes.Name, session.DisplayName),
+            new(MistChessClaims.PrincipalKind, MistChessClaims.GuestPrincipal)
         };
+        if (session.IsBanned)
+        {
+            claims.Add(new Claim(MistChessClaims.Banned, bool.TrueString));
+            claims.Add(new Claim(MistChessClaims.BanReason, session.BanReason ?? string.Empty));
+        }
         var principal = new ClaimsPrincipal(new ClaimsIdentity(claims, GuestAuthenticationDefaults.Scheme));
         return AuthenticateResult.Success(new AuthenticationTicket(principal, GuestAuthenticationDefaults.Scheme));
+    }
+
+    protected override Task HandleChallengeAsync(AuthenticationProperties properties) =>
+        WriteAuthenticationErrorAsync(
+            StatusCodes.Status401Unauthorized,
+            new ErrorResponse("UNAUTHORIZED", "A valid guest session is required."));
+
+    protected override Task HandleForbiddenAsync(AuthenticationProperties properties)
+    {
+        if (Context.User.HasClaim(MistChessClaims.Banned, bool.TrueString))
+        {
+            return WriteAuthenticationErrorAsync(
+                StatusCodes.Status403Forbidden,
+                new ErrorResponse(
+                    "PLAYER_BANNED",
+                    "This player is banned.",
+                    Context.User.FindFirstValue(MistChessClaims.BanReason)));
+        }
+
+        return WriteAuthenticationErrorAsync(
+            StatusCodes.Status403Forbidden,
+            new ErrorResponse("FORBIDDEN", "This guest session cannot access the requested resource."));
+    }
+
+    private Task WriteAuthenticationErrorAsync(int statusCode, ErrorResponse error)
+    {
+        Response.StatusCode = statusCode;
+        Response.ContentType = "application/json";
+        return Response.WriteAsJsonAsync(error, Context.RequestAborted);
     }
 }
 
@@ -86,9 +121,20 @@ public sealed class GuestSessionService(
                             participant.PlayerId == value.Id &&
                             participant.IsActive)
                         .Select(participant => (Guid?)participant.GameId)
-                        .SingleOrDefault()
+                        .SingleOrDefault(),
+                    value.IsBanned,
+                    value.BanReason,
                 })
                 .SingleAsync(cancellationToken);
+            if (existing.IsBanned)
+            {
+                throw new ApiException(
+                    StatusCodes.Status403Forbidden,
+                    "PLAYER_BANNED",
+                    "This player is banned.",
+                    existing.BanReason);
+            }
+
             return new GuestSessionView(
                 existing.Id,
                 existing.DisplayName,
@@ -103,7 +149,8 @@ public sealed class GuestSessionService(
             TokenHash = GuestToken.Hash(token),
             DisplayName = $"Guest {RandomNumberGenerator.GetInt32(100000, 1000000)}",
             CreatedAt = now,
-            ExpiresAt = now.Add(SessionLifetime)
+            ExpiresAt = now.Add(SessionLifetime),
+            LastSeenAt = now
         };
         db.GuestSessions.Add(session);
         await db.SaveChangesAsync(cancellationToken);

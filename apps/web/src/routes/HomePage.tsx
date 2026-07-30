@@ -116,15 +116,6 @@ export function HomePage() {
           在迷雾中
           <span>走出胜局</span>
         </h1>
-        <p>
-          标准中国象棋规则，叠加双方独立动态视野。每一步都由服务器裁定，
-          看清局部，判断全局。
-        </p>
-        <div className="feature-row" aria-label="游戏特性">
-          <span>双人实时</span>
-          <span>无需注册</span>
-          <span>完整回放</span>
-        </div>
       </section>
 
       <section className="entry-grid" aria-label="开始游戏">
@@ -233,11 +224,6 @@ export function HomePage() {
         </p>
       ) : null}
 
-      <section className="rules-strip" aria-label="迷雾规则摘要">
-        <div><strong>01</strong><span>己方棋子与行动路线提供视野</span></div>
-        <div><strong>02</strong><span>每步后视野重算，不保留幽灵棋子</span></div>
-        <div><strong>03</strong><span>只按服务器候选落点行动</span></div>
-      </section>
     </div>
   )
 }

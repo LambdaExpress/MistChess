@@ -942,6 +942,27 @@ public sealed class HistoryService(
         return new HistoricalReplayResponse(replay, CreateETag(game, side));
     }
 
+    public async Task<HistoricalReplayView> AdminReplayAsync(
+        Guid gameId,
+        CancellationToken cancellationToken)
+    {
+        var started = Stopwatch.GetTimestamp();
+        var game = await ReplayQuery()
+            .SingleOrDefaultAsync(
+                value => value.Id == gameId && value.Status == GameStatus.Finished,
+                cancellationToken)
+            ?? throw ApiException.NotFound();
+        var replay = BuildReplay(game, null);
+        var elapsedMilliseconds = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+        logger.LogInformation(
+            "Administrator replay rebuilt gameId={GameId} frameCount={FrameCount} elapsedMilliseconds={ElapsedMilliseconds}",
+            game.Id,
+            replay.Frames.Count,
+            elapsedMilliseconds);
+        metrics.RecordReplayBuild(shared: false, replay.Frames.Count, elapsedMilliseconds);
+        return replay;
+    }
+
     public async Task<HistoricalReplayView> SharedReplayAsync(
         string shareToken,
         CancellationToken cancellationToken)

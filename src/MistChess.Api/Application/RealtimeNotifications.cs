@@ -13,3 +13,12 @@ public interface IGameNotifier
     Task GameUpdatedAsync(Guid gameId, bool ended, CancellationToken cancellationToken);
     Task DrawOfferChangedAsync(Guid gameId, DrawOfferView offer, CancellationToken cancellationToken);
 }
+
+public interface IAccountNotifier
+{
+    Task AccountBannedAsync(
+        Guid playerId,
+        Guid? gameId,
+        string reason,
+        CancellationToken cancellationToken);
+}

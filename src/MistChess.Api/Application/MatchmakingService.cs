@@ -52,6 +52,10 @@ public sealed class MatchmakingService(
                 {
                     throw ApiException.NotFound();
                 }
+                if (lockedPlayers[0].IsBanned)
+                {
+                    throw ApiException.PlayerBanned(lockedPlayers[0].BanReason);
+                }
 
                 var idempotent = await db.MatchmakingTickets
                     .SingleOrDefaultAsync(
@@ -384,11 +388,12 @@ public sealed class MatchmakingCoordinator(
         try
         {
             var failedAttempts = 0;
+            var deferredTicketIds = new HashSet<Guid>();
             while (true)
             {
                 try
                 {
-                    if (!await TryCreateOneMatchAsync(cancellationToken))
+                    if (!await TryCreateOneMatchAsync(deferredTicketIds, cancellationToken))
                     {
                         return;
                     }
@@ -417,13 +422,16 @@ public sealed class MatchmakingCoordinator(
         }
     }
 
-    private async Task<bool> TryCreateOneMatchAsync(CancellationToken cancellationToken)
+    private async Task<bool> TryCreateOneMatchAsync(
+        HashSet<Guid> deferredTicketIds,
+        CancellationToken cancellationToken)
     {
         await using var db = await contextFactory.CreateDbContextAsync(cancellationToken);
         await using var transaction = await db.Database.BeginTransactionAsync(
             IsolationLevel.ReadCommitted,
             cancellationToken);
         var now = timeProvider.GetUtcNow();
+        var excludedTicketIds = deferredTicketIds.ToArray();
         var expiredTickets = await db.MatchmakingTickets
             .FromSqlInterpolated(
                 $"""
@@ -448,6 +456,7 @@ public sealed class MatchmakingCoordinator(
                 SELECT ticket.*
                 FROM matchmaking_tickets AS ticket
                 WHERE ticket.status = 'Searching'
+                  AND ticket.id <> ALL ({excludedTicketIds})
                   AND ticket.time_control = {GameOptionsCatalog.QuickMatchTimeControlId}
                   AND ticket.move_time_limit_milliseconds = {GameOptionsCatalog.QuickMatchMoveTimeLimitMilliseconds}
                   AND ticket.expires_at > {now}
@@ -498,6 +507,7 @@ public sealed class MatchmakingCoordinator(
                     SELECT ticket.*
                     FROM matchmaking_tickets AS ticket
                     WHERE ticket.status = 'Searching'
+                      AND ticket.id <> ALL ({excludedTicketIds})
                       AND ticket.id <> {anchor.Id}
                       AND ticket.player_id <> {anchor.PlayerId}
                       AND ticket.rule_version = {anchor.RuleVersion}
@@ -524,6 +534,7 @@ public sealed class MatchmakingCoordinator(
                     SELECT ticket.*
                     FROM matchmaking_tickets AS ticket
                     WHERE ticket.status = 'Searching'
+                      AND ticket.id <> ALL ({excludedTicketIds})
                       AND ticket.id <> {anchor.Id}
                       AND ticket.player_id <> {anchor.PlayerId}
                       AND ticket.rule_version = {anchor.RuleVersion}
@@ -578,10 +589,55 @@ public sealed class MatchmakingCoordinator(
                 WHERE id IN ({playerIds[0]}, {playerIds[1]})
                 ORDER BY id
                 FOR UPDATE
+                SKIP LOCKED
                 """)
             .ToListAsync(cancellationToken);
+        if (lockedPlayers.Count != 2)
+        {
+            var lockedPlayerIds = lockedPlayers.Select(player => player.Id).ToHashSet();
+            var busyTickets = pair
+                .Where(ticket => !lockedPlayerIds.Contains(ticket.PlayerId))
+                .ToArray();
+            foreach (var ticket in busyTickets)
+            {
+                deferredTicketIds.Add(ticket.Id);
+            }
+
+            logger.LogDebug(
+                "Matchmaking scan skipped busy player session locks ticketIds={TicketIds}",
+                busyTickets.Select(ticket => ticket.Id));
+            await transaction.RollbackAsync(cancellationToken);
+            return true;
+        }
+
+        var bannedPlayerIds = lockedPlayers
+            .Where(player => player.IsBanned)
+            .Select(player => player.Id)
+            .ToHashSet();
+        if (bannedPlayerIds.Count > 0)
+        {
+            var bannedTickets = pair
+                .Where(ticket =>
+                    ticket.Status == DbTicketStatus.Searching &&
+                    bannedPlayerIds.Contains(ticket.PlayerId))
+                .ToArray();
+            foreach (var ticket in bannedTickets)
+            {
+                ticket.Status = DbTicketStatus.Cancelled;
+                ticket.ConcurrencyStamp++;
+            }
+
+            await db.SaveChangesAsync(cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+            RecordTicketOutcomes(expiredTickets, now);
+            RecordTicketOutcomes(bannedTickets, now);
+            await NotifyTicketUpdatesAsync(
+                expiredTickets.Concat(bannedTickets),
+                cancellationToken);
+            return true;
+        }
+
         var invalidPair =
-            lockedPlayers.Count != 2 ||
             pair.Any(ticket =>
                 ticket.Status != DbTicketStatus.Searching ||
                 ticket.ExpiresAt <= now ||

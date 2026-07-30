@@ -70,23 +70,25 @@ function PieceShape({ piece, perspective }: { piece: PieceView; perspective: Sid
       aria-label={ariaLabel}
       data-testid={`piece-${positionKey(piece.position)}`}
     >
-      {piece.side === 'red' ? (
-        <>
-          <circle r="22" className="board-piece__body" />
-          <circle r="17.5" className="board-piece__inner" />
-        </>
-      ) : (
-        <>
-          <polygon
-            points="-15.5,-15.5 15.5,-15.5 22,0 15.5,15.5 -15.5,15.5 -22,0"
-            className="board-piece__body"
-          />
-          <circle r="17.5" className="board-piece__inner" />
-        </>
-      )}
-      <text textAnchor="middle" dominantBaseline="central" aria-hidden="true">
-        {name}
-      </text>
+      <g className="board-piece__content board-horizontal-scale">
+        {piece.side === 'red' ? (
+          <>
+            <circle r="22" className="board-piece__body" />
+            <circle r="17.5" className="board-piece__inner" />
+          </>
+        ) : (
+          <>
+            <polygon
+              points="-15.5,-15.5 15.5,-15.5 22,0 15.5,15.5 -15.5,15.5 -22,0"
+              className="board-piece__body"
+            />
+            <circle r="17.5" className="board-piece__inner" />
+          </>
+        )}
+        <text textAnchor="middle" dominantBaseline="central" aria-hidden="true">
+          {name}
+        </text>
+      </g>
     </g>
   )
 }
@@ -178,6 +180,7 @@ export function GameBoard({
       <svg
         className="game-board__svg"
         viewBox="0 0 583 583"
+        preserveAspectRatio="none"
         role="img"
         aria-label={boardName}
       >
@@ -235,20 +238,23 @@ export function GameBoard({
         </g>
         {selected ? (() => {
           const point = boardPoint(selected, view.perspective)
-          return <circle cx={point.x} cy={point.y} r="27" className="board-selection" aria-hidden="true" />
+          return (
+            <g transform={`translate(${point.x} ${point.y})`} aria-hidden="true">
+              <circle r="27" className="board-selection board-horizontal-scale" />
+            </g>
+          )
         })() : null}
         <g className="candidate-layer" aria-hidden="true">
           {destinations.map((destination) => {
             const point = boardPoint(destination, view.perspective)
             const occupied = piecesByPosition.has(positionKey(destination))
             return occupied ? (
-              <circle
+              <g
                 key={positionKey(destination)}
-                cx={point.x}
-                cy={point.y}
-                r="27"
-                className="candidate-capture"
-              />
+                transform={`translate(${point.x} ${point.y})`}
+              >
+                <circle r="27" className="candidate-capture board-horizontal-scale" />
+              </g>
             ) : (
               <circle
                 key={positionKey(destination)}

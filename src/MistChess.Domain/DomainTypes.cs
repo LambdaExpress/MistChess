@@ -33,7 +33,8 @@ public enum GameEndReason
     Timeout,
     AgreedDraw,
     Repetition,
-    NoProgress
+    NoProgress,
+    AdministrativeForfeit
 }
 
 public readonly record struct Position(byte File, byte Rank)

@@ -480,6 +480,108 @@ public sealed class PostgresApiWorkflowTests(PostgresDatabaseFixture database) :
     }
 
     [Fact]
+    public async Task Guest_lock_contention_does_not_cancel_healthy_matchmaking_tickets()
+    {
+        using var first = await CreatePlayerAsync();
+        using var second = await CreatePlayerAsync();
+        var firstSession = await PostAsync<GuestSessionView>(first, "/api/sessions/guest", body: null);
+        var firstTicket = await PostAsync<MatchTicketView>(
+            first,
+            "/api/matchmaking/tickets",
+            Ticket("guest-lock-first"));
+
+        await using var lockConnection = new NpgsqlConnection(database.ConnectionString);
+        await lockConnection.OpenAsync();
+        await using var lockTransaction = await lockConnection.BeginTransactionAsync();
+        await using (var lockCommand = new NpgsqlCommand(
+            "SELECT 1 FROM guest_sessions WHERE id = @player_id FOR UPDATE",
+            lockConnection,
+            lockTransaction))
+        {
+            lockCommand.Parameters.AddWithValue("player_id", firstSession.PlayerId);
+            (await lockCommand.ExecuteScalarAsync()).Should().Be(1);
+        }
+
+        var secondTicket = await PostAsync<MatchTicketView>(
+            second,
+            "/api/matchmaking/tickets",
+            Ticket("guest-lock-second"));
+        secondTicket.Status.Should().Be(MatchTicketStatus.Searching);
+        (await GetAsync<MatchTicketView>(
+            first,
+            "/api/matchmaking/tickets/current")).Status.Should().Be(MatchTicketStatus.Searching);
+
+        await lockTransaction.CommitAsync();
+        await _factory.Services
+            .GetRequiredService<MatchmakingCoordinator>()
+            .TryMatchAsync(CancellationToken.None);
+
+        var matchedFirst = await GetAsync<MatchTicketView>(
+            first,
+            "/api/matchmaking/tickets/current");
+        var matchedSecond = await GetAsync<MatchTicketView>(
+            second,
+            "/api/matchmaking/tickets/current");
+        matchedFirst.Status.Should().Be(MatchTicketStatus.Matched);
+        matchedSecond.Status.Should().Be(MatchTicketStatus.Matched);
+        matchedSecond.GameId.Should().Be(matchedFirst.GameId);
+        matchedFirst.TicketId.Should().Be(firstTicket.TicketId);
+    }
+
+    [Fact]
+    public async Task Busy_oldest_guest_does_not_block_other_healthy_matchmaking_tickets()
+    {
+        using var first = await CreatePlayerAsync();
+        using var second = await CreatePlayerAsync();
+        using var third = await CreatePlayerAsync();
+        var firstSession = await PostAsync<GuestSessionView>(
+            first,
+            "/api/sessions/guest",
+            body: null);
+        var firstTicket = await PostAsync<MatchTicketView>(
+            first,
+            "/api/matchmaking/tickets",
+            Ticket("guest-lock-pool-first"));
+
+        await using var lockConnection = new NpgsqlConnection(database.ConnectionString);
+        await lockConnection.OpenAsync();
+        await using var lockTransaction = await lockConnection.BeginTransactionAsync();
+        await using (var lockCommand = new NpgsqlCommand(
+            "SELECT 1 FROM guest_sessions WHERE id = @player_id FOR UPDATE",
+            lockConnection,
+            lockTransaction))
+        {
+            lockCommand.Parameters.AddWithValue("player_id", firstSession.PlayerId);
+            (await lockCommand.ExecuteScalarAsync()).Should().Be(1);
+        }
+
+        var secondTicket = await PostAsync<MatchTicketView>(
+            second,
+            "/api/matchmaking/tickets",
+            Ticket("guest-lock-pool-second"));
+        secondTicket.Status.Should().Be(MatchTicketStatus.Searching);
+        var thirdTicket = await PostAsync<MatchTicketView>(
+            third,
+            "/api/matchmaking/tickets",
+            Ticket("guest-lock-pool-third"));
+
+        thirdTicket.Status.Should().Be(MatchTicketStatus.Matched);
+        thirdTicket.GameId.Should().NotBeNull();
+        var matchedSecond = await GetAsync<MatchTicketView>(
+            second,
+            "/api/matchmaking/tickets/current");
+        matchedSecond.Status.Should().Be(MatchTicketStatus.Matched);
+        matchedSecond.GameId.Should().Be(thirdTicket.GameId);
+        var waitingFirst = await GetAsync<MatchTicketView>(
+            first,
+            "/api/matchmaking/tickets/current");
+        waitingFirst.TicketId.Should().Be(firstTicket.TicketId);
+        waitingFirst.Status.Should().Be(MatchTicketStatus.Searching);
+
+        await lockTransaction.CommitAsync();
+    }
+
+    [Fact]
     public async Task Final_ready_racing_with_ticket_creation_leaves_one_active_path()
     {
         using var creator = await CreatePlayerAsync();

@@ -35,8 +35,13 @@ interface HubCapture {
   rawFrames: string[]
 }
 
-const baseUrl = process.env.MISTCHESS_E2E_BASE_URL ?? 'http://127.0.0.1:5173'
+const baseUrl = process.env.MISTCHESS_E2E_BASE_URL?.trim() || 'http://127.0.0.1:5173'
 const gamePathPattern = /\/game\/([^/?#]+)$/
+const e2eAdminUsername = process.env.MISTCHESS_E2E_ADMIN_USERNAME?.trim()
+const e2eAdminPassword = process.env.MISTCHESS_E2E_ADMIN_PASSWORD
+if (process.env.TEST_WORKER_INDEX !== undefined) {
+  delete process.env.MISTCHESS_E2E_ADMIN_PASSWORD
+}
 
 function browserContextOptions(testInfo: TestInfo, playerIndex: number): BrowserContextOptions {
   const device = testInfo.project.name === 'mobile-chromium'
@@ -299,6 +304,32 @@ async function submitFirstBoardMove(page: Page, gameId: string): Promise<{
   throw new Error('No enabled board piece exposed a candidate destination')
 }
 
+async function submitBoardMove(
+  page: Page,
+  gameId: string,
+  from: string,
+  to: string,
+): Promise<void> {
+  const board = page.getByTestId('game-board')
+  const source = board.locator(
+    `button[data-position="${from}"]:not([data-candidate])`,
+  )
+  await expect(source).toBeEnabled()
+  await source.click()
+  const destination = board.locator(
+    `button[data-position="${to}"][data-candidate="true"]`,
+  )
+  await expect(destination).toBeEnabled()
+
+  const responsePromise = waitForResponse(page, `/api/games/${gameId}/moves`)
+  await destination.click()
+  const response = await responsePromise
+  expect(response.ok()).toBeTruthy()
+  const submitted = response.request().postDataJSON() as MoveRequest
+  expect(submitted.from).toEqual(positionFromKey(from))
+  expect(submitted.to).toEqual(positionFromKey(to))
+}
+
 async function currentGame(player: PlayerClient, gameId: string): Promise<GameView> {
   const response = await player.context.request.get(`/api/games/${gameId}`)
   expect(response.ok()).toBeTruthy()
@@ -331,6 +362,48 @@ async function expectResponsivePage(page: Page, testInfo: TestInfo): Promise<voi
   expect(dimensions.bodyWidth).toBeLessThanOrEqual(dimensions.viewportWidth)
 }
 
+async function expectBoardViewportScaling(page: Page): Promise<void> {
+  const geometry = await page.getByTestId('game-board').evaluate((board) => {
+    const target = board.querySelector<HTMLButtonElement>(
+      'button[data-position]:not([data-candidate])',
+    )
+    const position = target?.dataset.position
+    const piece = position
+      ? board.querySelector<SVGGElement>(`[data-testid="piece-${position}"]`)
+      : null
+    const scaledPiece = piece?.querySelector<SVGGElement>('.board-horizontal-scale')
+    if (!scaledPiece || !target) return null
+
+    const boardBounds = board.getBoundingClientRect()
+    const pieceBounds = scaledPiece.getBoundingClientRect()
+    const targetBounds = target.getBoundingClientRect()
+    const transform = getComputedStyle(scaledPiece).transform
+    const matrix = transform === 'none' ? new DOMMatrixReadOnly() : new DOMMatrixReadOnly(transform)
+    return {
+      aspectRatio: boardBounds.width / boardBounds.height,
+      pieceScaleX: matrix.a,
+      portraitRuleActive: matchMedia(
+        '(max-width: 780px) and (orientation: portrait)',
+      ).matches,
+      centerDeltaX: Math.abs(
+        pieceBounds.left + pieceBounds.width / 2
+          - targetBounds.left - targetBounds.width / 2,
+      ),
+      centerDeltaY: Math.abs(
+        pieceBounds.top + pieceBounds.height / 2
+          - targetBounds.top - targetBounds.height / 2,
+      ),
+    }
+  })
+
+  expect(geometry).not.toBeNull()
+  const portrait = geometry!.portraitRuleActive
+  expect(geometry!.aspectRatio).toBeCloseTo(portrait ? 5 / 6 : 1, 1)
+  expect(geometry!.pieceScaleX).toBeCloseTo(portrait ? 1.2 : 1, 2)
+  expect(geometry!.centerDeltaX).toBeLessThan(1)
+  expect(geometry!.centerDeltaY).toBeLessThan(1)
+}
+
 async function verifyReplayPage(page: Page, testInfo: TestInfo): Promise<void> {
   await expect(page).toHaveURL(/\/history\/[^/]+$/)
   await expect(page.getByRole('heading', { name: '迷雾棋局回放' })).toBeVisible()
@@ -357,6 +430,116 @@ async function verifyReplayPage(page: Page, testInfo: TestInfo): Promise<void> {
   await expect(page.getByText('初始局面')).toHaveCount(0)
   await expectResponsivePage(page, testInfo)
 }
+
+test('real browsers decode and start the distinct move and capture audio assets', async ({ page }) => {
+  await page.goto(baseUrl)
+  await expect(page.getByRole('button', { name: '寻找对手' })).toBeVisible()
+
+  const decoded = await page.evaluate(async () => {
+    const probe = document.createElement('audio')
+    const playableExtension = probe.canPlayType('audio/ogg; codecs="vorbis"') ? 'ogg' : 'mp3'
+    const playableSources = [
+      `/audio/move.${playableExtension}`,
+      `/audio/capture.${playableExtension}`,
+    ]
+    const sources = [
+      '/audio/move.ogg',
+      '/audio/capture.ogg',
+      '/audio/move.mp3',
+      '/audio/capture.mp3',
+    ]
+    const audioContext = new AudioContext()
+    try {
+      const metrics = await Promise.all(sources.map(async (source) => {
+        const response = await fetch(source)
+        if (!response.ok) throw new Error(`Audio asset failed to load: ${source}`)
+        const buffer = await audioContext.decodeAudioData(await response.arrayBuffer())
+        const samples = buffer.getChannelData(0)
+        let peak = 0
+        let energy = 0
+        for (const sample of samples) {
+          peak = Math.max(peak, Math.abs(sample))
+          energy += sample * sample
+        }
+        return {
+          source,
+          duration: buffer.duration,
+          peak,
+          rms: Math.sqrt(energy / samples.length),
+        }
+      }))
+      return { playableSources, metrics }
+    } finally {
+      await audioContext.close()
+    }
+  })
+
+  expect(decoded.metrics).toHaveLength(4)
+  for (const metric of decoded.metrics) {
+    expect(metric.duration).toBeGreaterThan(0.1)
+    expect(metric.peak).toBeGreaterThan(0.2)
+  }
+  for (const extension of ['ogg', 'mp3']) {
+    const move = decoded.metrics.find((metric) => metric.source === `/audio/move.${extension}`)
+    const capture = decoded.metrics.find(
+      (metric) => metric.source === `/audio/capture.${extension}`,
+    )
+    expect(move).toBeDefined()
+    expect(capture).toBeDefined()
+    expect(capture!.duration).toBeGreaterThan(move!.duration * 1.5)
+    expect(move!.rms).not.toBeCloseTo(capture!.rms, 2)
+  }
+
+  await page.evaluate((sources) => {
+    const button = document.createElement('button')
+    button.textContent = '播放验证音效'
+    button.addEventListener('click', () => {
+      const players = sources.map((source) => new Audio(source))
+      ;(window as Window & { __audioPlayback?: Promise<string[]> }).__audioPlayback =
+        Promise.all(players.map(async (player) => {
+          await player.play()
+          const resolvedSource = player.currentSrc
+          player.pause()
+          return resolvedSource
+        }))
+    })
+    document.body.append(button)
+  }, decoded.playableSources)
+  await page.getByRole('button', { name: '播放验证音效' }).click()
+  const playbackSources = await page.evaluate(() =>
+    (window as Window & { __audioPlayback?: Promise<string[]> }).__audioPlayback)
+  expect(playbackSources).toHaveLength(2)
+  expect(playbackSources?.every((source) => source.startsWith('http'))).toBe(true)
+})
+
+test('home page omits the promotional copy and rule footer', async ({ browser }, testInfo) => {
+  const context = await browser.newContext(browserContextOptions(testInfo, 0))
+  const page = await context.newPage()
+
+  try {
+    await page.goto(baseUrl)
+    await expect(page.getByRole('button', { name: '寻找对手' })).toBeVisible()
+    for (const removedText of [
+      '标准中国象棋规则',
+      '双人实时',
+      '无需注册',
+      '完整回放',
+      '己方棋子与行动路线提供视野',
+      '每步后视野重算',
+      '只按服务器候选落点行动',
+      '服务端权威裁定',
+    ]) {
+      await expect(page.getByText(removedText, { exact: false })).toHaveCount(0)
+    }
+    await expectResponsivePage(page, testInfo)
+    await page.screenshot({
+      path: testInfo.outputPath('home-without-promotional-copy.png'),
+      fullPage: true,
+    })
+  } finally {
+    await context.close()
+  }
+})
 
 test('quick match completes through the UI with isolated realtime views and recovery', async ({ browser }, testInfo) => {
   const players = await openTwoPlayers(browser, testInfo)
@@ -429,6 +612,8 @@ test('quick match completes through the UI with isolated realtime views and reco
     ])
     await expectResponsivePage(playerA.page, testInfo)
     await expectResponsivePage(playerB.page, testInfo)
+    await expectBoardViewportScaling(playerA.page)
+    await expectBoardViewportScaling(playerB.page)
 
     const [perspectiveA, perspectiveB] = await Promise.all([
       domPerspective(playerA.page),
@@ -655,6 +840,66 @@ test('quick match completes through the UI with isolated realtime views and reco
   }
 })
 
+test('mobile portrait completes a normal move and capture without landscape regression', async ({
+  browser,
+}, testInfo) => {
+  test.skip(
+    testInfo.project.name !== 'mobile-chromium',
+    'The portrait capture scenario runs in the Pixel 5 project.',
+  )
+  const players = await openTwoPlayers(browser, testInfo)
+  const [first, second] = players
+
+  try {
+    await first.page.getByRole('button', { name: '寻找对手' }).click()
+    await expect(first.page.getByRole('heading', { name: '正在为你匹配对手…' }))
+      .toBeVisible()
+    await second.page.getByRole('button', { name: '寻找对手' }).click()
+    await Promise.all([
+      expect(first.page).toHaveURL(gamePathPattern),
+      expect(second.page).toHaveURL(gamePathPattern),
+      expect(first.page.getByTestId('game-board')).toBeVisible(),
+      expect(second.page.getByTestId('game-board')).toBeVisible(),
+    ])
+
+    const gameId = gameIdFromPage(first.page)
+    const firstPerspective = await domPerspective(first.page)
+    const red = firstPerspective === 'red' ? first : second
+    const black = firstPerspective === 'black' ? first : second
+    await expectBoardViewportScaling(red.page)
+    await expectBoardViewportScaling(black.page)
+
+    await submitBoardMove(red.page, gameId, '0:3', '0:4')
+    await expect(black.page.getByRole('heading', { name: '轮到你行棋' })).toBeVisible()
+    await submitBoardMove(black.page, gameId, '0:6', '0:5')
+    await expect(red.page.getByRole('heading', { name: '轮到你行棋' })).toBeVisible()
+    await submitBoardMove(red.page, gameId, '0:4', '0:5')
+
+    await expect.poll(() => playedSounds(red.page)).toContain('move-self')
+    await expect.poll(() => playedSounds(red.page)).toContain('capture')
+    await expect.poll(() => playedSounds(black.page)).toContain('move-self')
+    await expect.poll(() => playedSounds(black.page)).toContain('capture')
+
+    await red.page.setViewportSize({ width: 740, height: 393 })
+    const landscapeMedia = await red.page.evaluate(() => ({
+      compact: matchMedia('(max-width: 780px)').matches,
+      portrait: matchMedia('(max-width: 780px) and (orientation: portrait)').matches,
+      landscape: matchMedia('(orientation: landscape)').matches,
+    }))
+    expect(landscapeMedia).toEqual({ compact: true, portrait: false, landscape: true })
+    await expectBoardViewportScaling(red.page)
+    const landscapeWidth = await red.page.evaluate(() => ({
+      viewport: window.innerWidth,
+      document: document.documentElement.scrollWidth,
+      body: document.body.scrollWidth,
+    }))
+    expect(landscapeWidth.document).toBeLessThanOrEqual(landscapeWidth.viewport)
+    expect(landscapeWidth.body).toBeLessThanOrEqual(landscapeWidth.viewport)
+  } finally {
+    await Promise.all(players.map((player) => player.context.close()))
+  }
+})
+
 test('private room is created, joined, and started through page controls', async ({ browser }, testInfo) => {
   const players = await openTwoPlayers(browser, testInfo)
   const [creator, joiner] = players
@@ -744,4 +989,223 @@ test('private room is created, joined, and started through page controls', async
   } finally {
     await Promise.all(players.map((player) => player.context.close()))
   }
+})
+
+test.describe('administrator player lifecycle', () => {
+  test('an administrator can ban an active player, review the result, and restore access', async ({
+    browser,
+  }, testInfo) => {
+    test.skip(
+      !e2eAdminUsername,
+      'MISTCHESS_E2E_ADMIN_USERNAME is required for the administrator lifecycle scenario.',
+    )
+    test.skip(
+      !e2eAdminPassword,
+      'MISTCHESS_E2E_ADMIN_PASSWORD is required for the administrator lifecycle scenario.',
+    )
+    if (!e2eAdminUsername || !e2eAdminPassword) return
+
+    let players: [PlayerClient, PlayerClient] | undefined
+    let adminContext: BrowserContext | undefined
+
+    try {
+      players = await openTwoPlayers(browser, testInfo)
+      const [bannedPlayer, opponent] = players
+
+      const firstLobbySocketPromise = waitForHubSocket(bannedPlayer.page, '/hubs/lobby')
+      await bannedPlayer.page.getByRole('button', { name: '寻找对手' }).click()
+      const firstLobbySocket = await firstLobbySocketPromise
+      expect(new URL(firstLobbySocket.url()).pathname).toBe('/hubs/lobby')
+      await expect(
+        bannedPlayer.page.getByRole('heading', { name: '正在为你匹配对手…' }),
+      ).toBeVisible()
+
+      const bannedPlayerGameSocketPromise = waitForHubSocket(bannedPlayer.page, '/hubs/game')
+      const opponentGameSocketPromise = waitForHubSocket(opponent.page, '/hubs/game')
+      await opponent.page.getByRole('button', { name: '寻找对手' }).click()
+
+      await Promise.all([
+        expect(bannedPlayer.page).toHaveURL(gamePathPattern),
+        expect(opponent.page).toHaveURL(gamePathPattern),
+      ])
+      const gameId = gameIdFromPage(bannedPlayer.page)
+      expect(gameIdFromPage(opponent.page)).toBe(gameId)
+
+      const [bannedPlayerGameSocket, opponentGameSocket] = await Promise.all([
+        bannedPlayerGameSocketPromise,
+        opponentGameSocketPromise,
+      ])
+      expect(new URL(bannedPlayerGameSocket.url()).pathname).toBe('/hubs/game')
+      expect(new URL(opponentGameSocket.url()).pathname).toBe('/hubs/game')
+      await Promise.all([
+        expect(bannedPlayer.page.getByTestId('game-board')).toBeVisible(),
+        expect(opponent.page.getByTestId('game-board')).toBeVisible(),
+        expectGameHubConnected(bannedPlayer.page),
+        expectGameHubConnected(opponent.page),
+      ])
+      await Promise.all([
+        expectResponsivePage(bannedPlayer.page, testInfo),
+        expectResponsivePage(opponent.page, testInfo),
+      ])
+
+      const bannedSide = await domPerspective(bannedPlayer.page)
+      const winningSide = bannedSide === 'red' ? 'black' : 'red'
+      const winningSideName = winningSide === 'red' ? '红方' : '黑方'
+      const banReason = '管理员端到端验证：破坏公平对局。'
+
+      adminContext = await browser.newContext(browserContextOptions(testInfo, 2))
+      const adminPage = await adminContext.newPage()
+      await adminPage.goto('/admin/login')
+      await expect(adminPage.getByRole('heading', { name: '管理员登录' })).toBeVisible()
+      await adminPage.getByRole('textbox', { name: '用户名' }).fill(e2eAdminUsername)
+      await adminPage.getByLabel('密码').fill(e2eAdminPassword)
+      await adminPage.getByRole('button', { name: '进入管理后台' }).click()
+      await expect(adminPage).toHaveURL(/\/admin\/users$/)
+      await expect(adminPage.getByRole('heading', { name: '用户管理' })).toBeVisible()
+      await expectResponsivePage(adminPage, testInfo)
+      await adminPage.getByRole('link', { name: '当前在线' }).click()
+      await expect(adminPage).toHaveURL(/\/admin\/users\?online=online$/)
+      await expect(
+        adminPage.getByRole('link', { name: '当前在线' }),
+      ).toHaveAttribute('aria-current', 'page')
+
+      await adminPage
+        .getByRole('searchbox', { name: '名称或用户 ID' })
+        .fill(bannedPlayer.session.playerId)
+      await adminPage.getByRole('button', { name: '搜索', exact: true }).click()
+      const targetRow = adminPage.getByRole('row', {
+        name: new RegExp(bannedPlayer.session.playerId),
+      })
+      await expect(targetRow).toBeVisible()
+      await targetRow.getByRole('link', { name: '查看详情' }).click()
+      await expect(
+        adminPage.getByRole('heading', { name: bannedPlayer.session.displayName }),
+      ).toBeVisible()
+      await expect(adminPage.getByText(bannedPlayer.session.playerId, { exact: true })).toBeVisible()
+
+      await adminPage.getByRole('button', { name: '封禁用户' }).click()
+      const banDialog = adminPage.getByRole('dialog', {
+        name: `确认封禁 ${bannedPlayer.session.displayName}`,
+      })
+      await expect(banDialog).toBeVisible()
+      await banDialog.getByLabel('封禁原因（1–200 字）').fill(banReason)
+      await banDialog.getByRole('button', { name: '确认封禁' }).click()
+
+      await Promise.all([
+        expect(adminPage.getByText('用户已封禁。', { exact: true })).toBeVisible(),
+        expect(
+          bannedPlayer.page.getByRole('heading', { name: '账号已被封禁' }),
+        ).toBeVisible(),
+        expect(bannedPlayer.page.getByText(banReason, { exact: true })).toBeVisible(),
+        expect(opponent.page.getByRole('heading', { name: '棋局结束' })).toBeVisible(),
+        expect(
+          opponent.page.getByRole('heading', { name: `${winningSideName}获胜` }),
+        ).toBeVisible(),
+        expect(opponent.page.getByText('管理员判负', { exact: true })).toBeVisible(),
+      ])
+
+      await expect(adminPage.getByText('管理员封禁判负', { exact: true })).toBeVisible()
+      const replayLink = adminPage.getByRole('link', { name: '查看三视野回放' })
+      await expect(replayLink).toBeVisible()
+      await replayLink.click()
+      await expect(adminPage).toHaveURL(new RegExp(`/admin/games/${gameId}$`))
+      await expect(adminPage.getByRole('heading', { name: '管理员棋局回放' })).toBeVisible()
+      await expect(adminPage.getByText('管理员封禁判负', { exact: true })).toBeVisible()
+
+      const replayBoard = adminPage.getByTestId('game-board')
+      const replayModes = adminPage.getByRole('group', { name: '回放视野' })
+      const replaySlider = adminPage.getByRole('slider', { name: '回放进度' })
+      const finalFrame = await replaySlider.getAttribute('max')
+      expect(Number(finalFrame)).toBeGreaterThan(0)
+      await adminPage.getByRole('button', { name: '跳到终局' }).click()
+      await expect(replaySlider).toHaveValue(finalFrame as string)
+
+      await replayModes.getByRole('button', { name: '红方视野' }).click()
+      await expect(replayBoard.locator('svg.game-board__svg')).toHaveAttribute(
+        'aria-label',
+        /红方视野，第 \d+ 个半回合/,
+      )
+      expect(await replayBoard.locator('[data-testid^="fog-"]').count()).toBeGreaterThan(0)
+
+      await replayModes.getByRole('button', { name: '黑方视野' }).click()
+      await expect(replayBoard.locator('svg.game-board__svg')).toHaveAttribute(
+        'aria-label',
+        /黑方视野，第 \d+ 个半回合/,
+      )
+      expect(await replayBoard.locator('[data-testid^="fog-"]').count()).toBeGreaterThan(0)
+
+      await replayModes.getByRole('button', { name: '全局视野' }).click()
+      await expect(replayBoard.locator('svg.game-board__svg')).toHaveAttribute(
+        'aria-label',
+        /全局视野，第 \d+ 个半回合/,
+      )
+      await expect(replayBoard.locator('[data-testid^="fog-"]')).toHaveCount(0)
+      await expectResponsivePage(adminPage, testInfo)
+
+      await adminPage.goBack()
+      await expect(
+        adminPage.getByRole('heading', { name: bannedPlayer.session.displayName }),
+      ).toBeVisible()
+      await adminPage.getByRole('button', { name: '解除封禁' }).click()
+      const unbanDialog = adminPage.getByRole('dialog', {
+        name: `确认解封 ${bannedPlayer.session.displayName}`,
+      })
+      await expect(unbanDialog).toBeVisible()
+      await unbanDialog.getByRole('button', { name: '确认解封' }).click()
+      await expect(adminPage.getByText('用户已解除封禁。', { exact: true })).toBeVisible()
+      await expect(adminPage.getByRole('button', { name: '封禁用户' })).toBeVisible()
+
+      await bannedPlayer.page.reload()
+      await expect(
+        bannedPlayer.page.getByRole('heading', { name: '账号已被封禁' }),
+      ).toHaveCount(0)
+      await expect(bannedPlayer.page.getByRole('heading', { name: '棋局结束' })).toBeVisible()
+      await expectGameHubConnected(bannedPlayer.page)
+      await adminPage.getByRole('button', { name: '封禁用户' }).click()
+      await expect(banDialog).toBeVisible()
+      await banDialog.getByLabel('封禁原因（1–200 字）')
+        .fill('管理员端到端验证：已结束棋局连接。')
+      await banDialog.getByRole('button', { name: '确认封禁' }).click()
+      await expect(
+        bannedPlayer.page.getByRole('heading', { name: '账号已被封禁' }),
+      ).toBeVisible()
+
+      await adminPage.getByRole('button', { name: '解除封禁' }).click()
+      await expect(unbanDialog).toBeVisible()
+      await unbanDialog.getByRole('button', { name: '确认解封' }).click()
+      await expect(adminPage.getByText('用户已解除封禁。', { exact: true })).toBeVisible()
+      await bannedPlayer.page.reload()
+      await expect(bannedPlayer.page.getByRole('heading', { name: '棋局结束' })).toBeVisible()
+      await bannedPlayer.page.getByRole('link', { name: '迷雾象棋首页' }).click()
+      await expect(bannedPlayer.page).toHaveURL(/\/$/)
+      await expect(bannedPlayer.page.getByRole('heading', { name: '快速匹配' })).toBeVisible()
+      await expect(bannedPlayer.page.getByRole('button', { name: '寻找对手' })).toBeVisible()
+
+      const restoredLobbySocketPromise = waitForHubSocket(bannedPlayer.page, '/hubs/lobby')
+      await bannedPlayer.page.getByRole('button', { name: '寻找对手' }).click()
+      const restoredLobbySocket = await restoredLobbySocketPromise
+      expect(new URL(restoredLobbySocket.url()).pathname).toBe('/hubs/lobby')
+      await expect(
+        bannedPlayer.page.getByRole('heading', { name: '正在为你匹配对手…' }),
+      ).toBeVisible()
+      await expect(bannedPlayer.page.locator('.connection-pill')).toContainText('大厅已连接')
+      const restoredCancelResponsePromise = bannedPlayer.page.waitForResponse((response) => {
+        const path = new URL(response.url()).pathname
+        return path.startsWith('/api/matchmaking/tickets/')
+          && response.request().method() === 'DELETE'
+      })
+      await bannedPlayer.page.getByRole('button', { name: '取消匹配' }).click()
+      expect((await restoredCancelResponsePromise).ok()).toBeTruthy()
+      await expect(bannedPlayer.page).toHaveURL(/\/$/)
+      await expect(
+        bannedPlayer.page.getByRole('button', { name: '寻找对手' }),
+      ).toBeVisible()
+      await expectResponsivePage(bannedPlayer.page, testInfo)
+    } finally {
+      await Promise.all([
+        ...(players?.map((player) => player.context.close()) ?? []),
+        ...(adminContext ? [adminContext.close()] : []),
+      ])
+    }
+  })
 })

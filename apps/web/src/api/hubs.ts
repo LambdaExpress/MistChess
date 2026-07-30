@@ -9,6 +9,21 @@ import type { DrawOffer, GameView, MatchFound, MatchTicket } from './types'
 
 export type RealtimeState = 'connecting' | 'connected' | 'reconnecting' | 'disconnected'
 
+type AccountBannedPayload = string | { reason?: string }
+
+function dispatchPresenceRefresh() {
+  window.dispatchEvent(new Event('mistchess:presence-refresh'))
+}
+
+function dispatchAccountBanned(payload: AccountBannedPayload) {
+  const reason = typeof payload === 'string' ? payload : payload?.reason
+  window.dispatchEvent(
+    new CustomEvent<string>('mistchess:account-banned', {
+      detail: typeof reason === 'string' ? reason : '',
+    }),
+  )
+}
+
 interface LobbyHubHandlers {
   onTicket: (ticket: MatchTicket) => void
   onMatch: (match: MatchFound) => void
@@ -51,9 +66,11 @@ export function useLobbyHub(handlers: LobbyHubHandlers): RealtimeState {
     connection.on('MatchFound', (match: MatchFound) => {
       handlersRef.current.onMatch(match)
     })
+    connection.on('AccountBanned', dispatchAccountBanned)
     connection.onreconnecting(() => setState('reconnecting'))
     connection.onreconnected(() => {
       setState('connected')
+      dispatchPresenceRefresh()
       handlersRef.current.onReconnect()
     })
 
@@ -64,6 +81,7 @@ export function useLobbyHub(handlers: LobbyHubHandlers): RealtimeState {
         await connection.start()
         if (!disposed) {
           setState('connected')
+          dispatchPresenceRefresh()
           handlersRef.current.onReconnect()
         }
       } catch {
@@ -126,9 +144,11 @@ export function useGameHub(handlers: GameHubHandlers): RealtimeState {
         handlersRef.current.onOpponentConnection(connected)
       },
     )
+    connection.on('AccountBanned', dispatchAccountBanned)
     connection.onreconnecting(() => setState('reconnecting'))
     connection.onreconnected(() => {
       setState('connected')
+      dispatchPresenceRefresh()
       handlersRef.current.onReconnect()
     })
 
@@ -139,6 +159,7 @@ export function useGameHub(handlers: GameHubHandlers): RealtimeState {
         await connection.start()
         if (!disposed) {
           setState('connected')
+          dispatchPresenceRefresh()
           handlersRef.current.onReconnect()
         }
       } catch {

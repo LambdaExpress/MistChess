@@ -212,16 +212,6 @@ p {
   place-items: center;
 }
 
-.site-footer {
-  width: min(1180px, calc(100% - 40px));
-  margin: 56px auto 0;
-  padding: 24px 0 32px;
-  border-top: 1px solid rgba(23, 75, 61, 0.16);
-  color: var(--ink-soft);
-  text-align: center;
-  font-size: 12px;
-  letter-spacing: 0.08em;
-}
 
 .button {
   min-height: 46px;
@@ -386,7 +376,7 @@ p {
 
 .home-hero {
   max-width: 790px;
-  margin: 0 auto clamp(48px, 7vw, 82px);
+  margin: 0 auto clamp(32px, 4vw, 48px);
   text-align: center;
 }
 
@@ -398,7 +388,7 @@ p {
 }
 
 .home-hero h1 {
-  margin-bottom: 24px;
+  margin-bottom: 0;
   font: 700 clamp(48px, 8vw, 88px)/0.98 var(--serif);
   letter-spacing: 0.04em;
 }
@@ -409,30 +399,6 @@ p {
   color: var(--jade);
 }
 
-.home-hero > p {
-  max-width: 640px;
-  margin: 0 auto;
-  color: var(--ink-soft);
-  font-size: 17px;
-  line-height: 1.9;
-}
-
-.feature-row {
-  margin-top: 30px;
-  display: flex;
-  justify-content: center;
-  gap: 12px;
-  flex-wrap: wrap;
-}
-
-.feature-row span {
-  padding: 7px 13px;
-  border: 1px solid rgba(23, 75, 61, 0.22);
-  border-radius: 99px;
-  color: var(--jade);
-  font-size: 12px;
-  font-weight: 700;
-}
 
 .entry-grid {
   display: grid;
@@ -574,36 +540,6 @@ p {
   text-align: center;
 }
 
-.rules-strip {
-  margin-top: 28px;
-  padding: 28px 0;
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  border-top: 1px solid var(--line);
-  border-bottom: 1px solid var(--line);
-}
-
-.rules-strip div {
-  padding: 0 26px;
-  display: flex;
-  align-items: center;
-  gap: 15px;
-}
-
-.rules-strip div + div {
-  border-left: 1px solid var(--line);
-}
-
-.rules-strip strong {
-  color: var(--red);
-  font: 700 25px/1 var(--serif);
-}
-
-.rules-strip span {
-  color: var(--ink-soft);
-  font-size: 13px;
-  line-height: 1.5;
-}
 
 .match-page {
   min-height: 680px;
@@ -979,6 +915,16 @@ p {
   border-radius: 18px;
   box-shadow: 0 24px 60px rgba(35, 35, 27, 0.22);
   touch-action: manipulation;
+}
+
+@media (max-width: 780px) and (orientation: portrait) {
+  .game-board {
+    aspect-ratio: 5 / 6;
+  }
+
+  .board-horizontal-scale {
+    transform: scaleX(1.2);
+  }
 }
 
 .game-board--locked {
@@ -1731,8 +1677,7 @@ p {
 
 @media (max-width: 780px) {
   .site-header,
-  .app-main,
-  .site-footer {
+  .app-main {
     width: min(100% - 28px, 680px);
   }
 
@@ -1755,18 +1700,6 @@ p {
     min-height: 390px;
   }
 
-  .rules-strip {
-    grid-template-columns: 1fr;
-  }
-
-  .rules-strip div {
-    padding: 18px 10px;
-  }
-
-  .rules-strip div + div {
-    border-top: 1px solid var(--line);
-    border-left: 0;
-  }
 
   .match-page {
     padding: 55px 0;

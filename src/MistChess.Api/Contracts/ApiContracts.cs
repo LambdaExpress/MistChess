@@ -28,7 +28,8 @@ public enum GameResultReason
     Timeout,
     AgreedDraw,
     Repetition,
-    NoProgress
+    NoProgress,
+    AdministrativeForfeit
 }
 
 
@@ -38,6 +39,63 @@ public sealed record GuestSessionView(
     Guid? ActiveGameId);
 
 public sealed record AntiforgeryTokenView(string Token, string HeaderName);
+public sealed record AdminLoginRequest(
+    [Required, MinLength(1), MaxLength(64)][property: JsonRequired] string Username,
+    [Required, MinLength(1), MaxLength(1024)][property: JsonRequired] string Password);
+
+public sealed record AdminSessionView(string Username, DateTimeOffset ExpiresAt);
+
+public sealed record AdminRatingView(
+    string RuleVersion,
+    string TimeControl,
+    int Rating,
+    int GamesPlayed,
+    int Wins,
+    int Draws,
+    int Losses,
+    decimal? WinRate,
+    DateTimeOffset UpdatedAt);
+
+public sealed record AdminUserSummaryView(
+    Guid PlayerId,
+    string DisplayName,
+    DateTimeOffset CreatedAt,
+    DateTimeOffset ExpiresAt,
+    DateTimeOffset LastSeenAt,
+    bool Online,
+    bool Banned,
+    DateTimeOffset? BannedAt,
+    string? BanReason,
+    string? BannedBy,
+    int Rating,
+    int GamesPlayed,
+    int Wins,
+    int Draws,
+    int Losses,
+    decimal? WinRate);
+
+public sealed record AdminUsersPageView(
+    IReadOnlyList<AdminUserSummaryView> Items,
+    string? NextCursor,
+    DateTimeOffset ObservedAt);
+
+public sealed record AdminUserDetailView(
+    AdminUserSummaryView User,
+    IReadOnlyList<AdminRatingView> Ratings,
+    DateTimeOffset ObservedAt);
+
+public sealed record AdminBanRequest(
+    [Required, MinLength(1), MaxLength(200)][property: JsonRequired] string Reason);
+
+public sealed record AdminBanStatusView(
+    Guid PlayerId,
+    bool Banned,
+    DateTimeOffset? BannedAt,
+    string? BanReason,
+    string? BannedBy);
+
+public sealed record AccountBannedView(string Reason);
+
 public sealed record TimeControlOptionView(
     string Id,
     string Label,
@@ -169,6 +227,23 @@ public sealed record HistoricalGameSummaryView(
 
 public sealed record HistoricalGamesPageView(
     IReadOnlyList<HistoricalGameSummaryView> Games,
+    string? NextCursor);
+
+public sealed record AdminHistoricalGameSummaryView(
+    Guid GameId,
+    DateTimeOffset FinishedAt,
+    string RuleVersion,
+    string? TimeControl,
+    Side CurrentPlayerSide,
+    HistoricalPlayerView Red,
+    HistoricalPlayerView Black,
+    GameResultView Result,
+    int PlyCount,
+    int? MoveTimeLimitSeconds,
+    bool IsRated);
+
+public sealed record AdminHistoricalGamesPageView(
+    IReadOnlyList<AdminHistoricalGameSummaryView> Games,
     string? NextCursor);
 
 public sealed record ReplayFrameProjectionView(

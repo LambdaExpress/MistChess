@@ -19,6 +19,7 @@ const resultReasonLabel: Record<GameResult['reason'], string> = {
   agreedDraw: '协议和棋',
   repetition: '重复局面和棋',
   noProgress: '无进展和棋',
+  administrativeForfeit: '管理员判负',
 }
 
 export function HistoryPage() {

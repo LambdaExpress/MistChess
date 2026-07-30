@@ -21,7 +21,9 @@ public sealed class GameOptionsController : ControllerBase
 
 [ApiController]
 [Route("api/sessions")]
-public sealed class SessionsController(GuestSessionService sessions) : ControllerBase
+public sealed class SessionsController(
+    GuestSessionService sessions,
+    GuestPresenceService presence) : ControllerBase
 {
     [AllowAnonymous]
     [EnableRateLimiting("session")]
@@ -38,6 +40,19 @@ public sealed class SessionsController(GuestSessionService sessions) : Controlle
         }
 
         return Ok(await sessions.RestoreOrCreateAsync(HttpContext, cancellationToken));
+    }
+
+    [Authorize]
+    [ValidateAntiForgeryToken]
+    [EnableRateLimiting("presence")]
+    [HttpPost("heartbeat", Name = "heartbeatGuestSession")]
+    [ProducesResponseType(StatusCodes.Status204NoContent)]
+    [ProducesResponseType<ErrorResponse>(StatusCodes.Status401Unauthorized)]
+    [ProducesResponseType<ErrorResponse>(StatusCodes.Status403Forbidden)]
+    public async Task<IActionResult> Heartbeat(CancellationToken cancellationToken)
+    {
+        await presence.TouchAsync(CurrentPlayer.GetId(User), cancellationToken);
+        return NoContent();
     }
 }
 

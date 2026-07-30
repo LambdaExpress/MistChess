@@ -24,6 +24,10 @@ public sealed class RoomService(
         var moveTimeLimit = GameOptionsCatalog.NormalizeRoomMoveTimeLimit(
             timeControl,
             request.MoveTimeLimitSeconds);
+        await using var transaction = await db.Database.BeginTransactionAsync(
+            IsolationLevel.ReadCommitted,
+            cancellationToken);
+        await LockPlayerForMutationAsync(playerId, cancellationToken);
         await EnsurePlayerCanStartGameAsync(playerId, cancellationToken);
         var now = timeProvider.GetUtcNow();
         var room = new RoomEntity
@@ -48,6 +52,7 @@ public sealed class RoomService(
         });
         db.Rooms.Add(room);
         await db.SaveChangesAsync(cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
         return await LoadViewAsync(room.Code, playerId, cancellationToken);
     }
 
@@ -55,6 +60,7 @@ public sealed class RoomService(
     {
         code = NormalizeCode(code);
         await using var transaction = await db.Database.BeginTransactionAsync(IsolationLevel.Serializable, cancellationToken);
+        await LockPlayerForMutationAsync(playerId, cancellationToken);
         var room = await db.Rooms
             .Include(value => value.Players)
             .ThenInclude(value => value.Player)
@@ -133,7 +139,42 @@ public sealed class RoomService(
         CancellationToken cancellationToken)
     {
         code = NormalizeCode(code);
-        await using var transaction = await db.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, cancellationToken);
+        var expectedParticipantIds = ready
+            ? await db.RoomPlayers
+                .AsNoTracking()
+                .Where(member => member.Room.Code == code)
+                .OrderBy(member => member.PlayerId)
+                .Select(member => member.PlayerId)
+                .ToArrayAsync(cancellationToken)
+            : [];
+        await using var transaction = await db.Database.BeginTransactionAsync(
+            IsolationLevel.ReadCommitted,
+            cancellationToken);
+        List<GuestSessionEntity> lockedPlayers = [];
+        if (expectedParticipantIds.Length == 2)
+        {
+            lockedPlayers = await db.GuestSessions
+                .FromSqlInterpolated(
+                    $"""
+                    SELECT *
+                    FROM guest_sessions
+                    WHERE id IN ({expectedParticipantIds[0]}, {expectedParticipantIds[1]})
+                    ORDER BY id
+                    FOR UPDATE
+                    """)
+                .ToListAsync(cancellationToken);
+            if (lockedPlayers.Count != expectedParticipantIds.Length)
+            {
+                throw ApiException.NotFound();
+            }
+
+            var currentPlayer = lockedPlayers.SingleOrDefault(value => value.Id == playerId);
+            if (currentPlayer?.IsBanned == true)
+            {
+                throw ApiException.PlayerBanned(currentPlayer.BanReason);
+            }
+        }
+
         var lockedRooms = await db.Rooms
             .FromSqlInterpolated($"SELECT * FROM rooms WHERE code = {code} FOR UPDATE")
             .ToListAsync(cancellationToken);
@@ -162,20 +203,14 @@ public sealed class RoomService(
         {
             var participantIds = room.Players
                 .Select(value => value.PlayerId)
+                .OrderBy(value => value)
                 .ToArray();
-            var lockedPlayers = await db.GuestSessions
-                .FromSqlInterpolated(
-                    $"""
-                    SELECT *
-                    FROM guest_sessions
-                    WHERE id IN ({participantIds[0]}, {participantIds[1]})
-                    ORDER BY id
-                    FOR UPDATE
-                    """)
-                .ToListAsync(cancellationToken);
-            if (lockedPlayers.Count != participantIds.Length)
+            if (lockedPlayers.Count != participantIds.Length ||
+                !lockedPlayers.Select(value => value.Id).SequenceEqual(participantIds))
             {
-                throw ApiException.NotFound();
+                throw ApiException.Conflict(
+                    "ROOM_MEMBERS_CHANGED",
+                    "The room membership changed while the game was starting.");
             }
 
             foreach (var participant in room.Players)
@@ -212,6 +247,23 @@ public sealed class RoomService(
             .ThenInclude(value => value.Player)
             .SingleAsync(value => value.Code == code, cancellationToken);
         return ToView(room, playerId);
+    }
+
+    private async Task<GuestSessionEntity> LockPlayerForMutationAsync(
+        Guid playerId,
+        CancellationToken cancellationToken)
+    {
+        var lockedPlayers = await db.GuestSessions
+            .FromSqlInterpolated(
+                $"SELECT * FROM guest_sessions WHERE id = {playerId} FOR UPDATE")
+            .ToListAsync(cancellationToken);
+        var player = lockedPlayers.SingleOrDefault() ?? throw ApiException.NotFound();
+        if (player.IsBanned)
+        {
+            throw ApiException.PlayerBanned(player.BanReason);
+        }
+
+        return player;
     }
 
     private async Task EnsurePlayerCanStartGameAsync(Guid playerId, CancellationToken cancellationToken)

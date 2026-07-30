@@ -77,6 +77,40 @@ describe('GameBoard', () => {
     expect(within(visiblePieces).queryByText(/黑方车/)).not.toBeInTheDocument()
   })
 
+  it('keeps board coordinates separate from portrait piece and ring scaling', async () => {
+    const user = userEvent.setup()
+    const { container } = render(
+      <GameBoard
+        view={createView({
+          candidateMoves: [
+            { from: { file: 0, rank: 0 }, destinations: [{ file: 4, rank: 5 }] },
+          ],
+        })}
+      />,
+    )
+
+    const board = screen.getByRole('img', { name: /中国迷雾象棋棋盘/ })
+    expect(board).toHaveAttribute('viewBox', '0 0 583 583')
+    expect(board).toHaveAttribute('preserveAspectRatio', 'none')
+
+    const piece = screen.getByTestId('piece-0:0')
+    expect(piece).toHaveAttribute('transform', 'translate(71.5 539)')
+    expect(piece.firstElementChild).toHaveClass(
+      'board-piece__content',
+      'board-horizontal-scale',
+    )
+
+    const sourceTarget = screen.getByRole('button', { name: /选择红方车/ })
+    expect(sourceTarget.style.left).toBe(`${(71.5 / 583) * 100}%`)
+    expect(sourceTarget.style.top).toBe(`${(539 / 583) * 100}%`)
+    await user.click(sourceTarget)
+
+    expect(container.querySelector('.board-selection.board-horizontal-scale'))
+      .toBeInTheDocument()
+    expect(container.querySelector('.candidate-capture.board-horizontal-scale'))
+      .toBeInTheDocument()
+  })
+
   it('keeps the board unchanged and locks a selected move while submission is pending', async () => {
     const user = userEvent.setup()
     const onMove = vi.fn()

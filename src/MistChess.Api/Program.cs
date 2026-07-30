@@ -6,6 +6,9 @@ using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
 using System.Threading.RateLimiting;
 using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.Authentication.Cookies;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.AspNetCore.Mvc;
@@ -91,6 +94,8 @@ builder.Services.AddSingleton<MistChessMetrics>();
 builder.Services.AddSingleton<RatingService>();
 builder.Services.AddSingleton<GameCompletionService>();
 builder.Services.AddScoped<GuestSessionService>();
+builder.Services.AddScoped<GuestPresenceService>();
+builder.Services.AddScoped<AdminUserService>();
 builder.Services.AddScoped<RoomService>();
 builder.Services.AddScoped<MatchmakingService>();
 builder.Services.AddScoped<GameService>();
@@ -98,17 +103,61 @@ builder.Services.AddScoped<HistoryService>();
 builder.Services.AddSingleton<GameConnectionTracker>();
 builder.Services.AddSingleton<ILobbyNotifier, SignalRLobbyNotifier>();
 builder.Services.AddSingleton<IGameNotifier, SignalRGameNotifier>();
+builder.Services.AddSingleton<IAccountNotifier, SignalRAccountNotifier>();
 builder.Services.AddSingleton<MatchmakingCoordinator>();
 builder.Services.AddHostedService<MatchmakingWorker>();
 builder.Services.AddHostedService<GameClockWorker>();
 builder.Services.AddSingleton<PreAuthenticationRateLimitMiddleware>();
+builder.Services.Configure<AdminOptions>(builder.Configuration.GetSection("Admin"));
+builder.Services.AddSingleton<IPasswordHasher<AdminOptions>, PasswordHasher<AdminOptions>>();
+builder.Services.AddSingleton<AdminLoginFailureLimiter>();
+builder.Services.AddScoped<AdminCredentialService>();
 
 builder.Services
     .AddAuthentication(GuestAuthenticationDefaults.Scheme)
     .AddScheme<AuthenticationSchemeOptions, GuestAuthenticationHandler>(
         GuestAuthenticationDefaults.Scheme,
-        _ => { });
-builder.Services.AddAuthorization();
+        _ => { })
+    .AddCookie(AdminAuthenticationDefaults.Scheme, options =>
+    {
+        options.Cookie.Name = AdminAuthenticationDefaults.GetCookieName(builder.Environment);
+        options.Cookie.HttpOnly = true;
+        options.Cookie.SecurePolicy = builder.Environment.IsDevelopment()
+            ? CookieSecurePolicy.SameAsRequest
+            : CookieSecurePolicy.Always;
+        options.Cookie.SameSite = SameSiteMode.Strict;
+        options.Cookie.Path = "/";
+        options.Cookie.IsEssential = true;
+        options.ExpireTimeSpan = AdminAuthenticationDefaults.Lifetime;
+        options.SlidingExpiration = false;
+        options.Events = new CookieAuthenticationEvents
+        {
+            OnRedirectToLogin = context => WriteAuthenticationErrorAsync(
+                context.Response,
+                StatusCodes.Status401Unauthorized,
+                new ErrorResponse("UNAUTHORIZED", "Administrator authentication is required.")),
+            OnRedirectToAccessDenied = context => WriteAuthenticationErrorAsync(
+                context.Response,
+                StatusCodes.Status403Forbidden,
+                new ErrorResponse("FORBIDDEN", "Administrator access is required."))
+        };
+    });
+builder.Services.AddAuthorization(options =>
+{
+    options.DefaultPolicy = new AuthorizationPolicyBuilder()
+        .RequireAuthenticatedUser()
+        .RequireClaim(MistChessClaims.PrincipalKind, MistChessClaims.GuestPrincipal)
+        .RequireAssertion(context => !context.User.HasClaim(
+            MistChessClaims.Banned,
+            bool.TrueString))
+        .Build();
+    options.AddPolicy(
+        AdminAuthenticationDefaults.AuthorizationPolicy,
+        new AuthorizationPolicyBuilder(AdminAuthenticationDefaults.Scheme)
+            .RequireAuthenticatedUser()
+            .RequireClaim(MistChessClaims.PrincipalKind, MistChessClaims.AdminPrincipal)
+            .Build());
+});
 builder.Services.AddAntiforgery(options =>
 {
     options.HeaderName = "X-CSRF-TOKEN";
@@ -188,6 +237,9 @@ builder.Services.AddRateLimiter(options =>
     options.AddPolicy("history-read", context => FixedWindow(PlayerKey(context), 60, TimeSpan.FromMinutes(1)));
     options.AddPolicy("share-change", context => FixedWindow(PlayerKey(context), 10, TimeSpan.FromMinutes(1)));
     options.AddPolicy("share-read", context => FixedWindow(ShareReadKey(context), 60, TimeSpan.FromMinutes(1)));
+    options.AddPolicy("presence", context => FixedWindow(PlayerKey(context), 12, TimeSpan.FromMinutes(1)));
+    options.AddPolicy("admin-users", context => FixedWindow(AdminKey(context), 60, TimeSpan.FromMinutes(1)));
+    options.AddPolicy("admin-history", context => FixedWindow(AdminKey(context), 60, TimeSpan.FromMinutes(1)));
     options.AddPolicy("move", context => FixedWindow(
         PlayerKey(context),
         20,
@@ -196,6 +248,12 @@ builder.Services.AddRateLimiter(options =>
 });
 
 var app = builder.Build();
+var adminOptions = app.Services.GetRequiredService<Microsoft.Extensions.Options.IOptions<AdminOptions>>().Value;
+if (!adminOptions.IsConfigured)
+{
+    app.Logger.LogWarning(
+        "Administrator login is disabled because Admin:Username or Admin:PasswordHash is missing.");
+}
 var hasStaticWebApp = Directory.Exists(app.Environment.WebRootPath)
     && File.Exists(Path.Combine(app.Environment.WebRootPath, "index.html"));
 app.UseForwardedHeaders();
@@ -236,6 +294,7 @@ if (hasStaticWebApp)
 app.UseRouting();
 app.UseMiddleware<PreAuthenticationRateLimitMiddleware>();
 app.UseAuthentication();
+app.UseMiddleware<GuestPresenceMiddleware>();
 app.UseRateLimiter();
 app.UseAuthorization();
 
@@ -294,6 +353,21 @@ static RateLimitPartition<string> FixedWindow(string key, int permitLimit, TimeS
             QueueLimit = 0,
             AutoReplenishment = true
         });
+
+static string AdminKey(HttpContext context) =>
+    context.User.FindFirst(MistChessClaims.PrincipalKind)?.Value == MistChessClaims.AdminPrincipal
+        ? context.User.Identity?.Name ?? "admin"
+        : context.Connection.RemoteIpAddress?.ToString() ?? "anonymous";
+
+static async Task WriteAuthenticationErrorAsync(
+    HttpResponse response,
+    int statusCode,
+    ErrorResponse error)
+{
+    response.StatusCode = statusCode;
+    response.ContentType = "application/json";
+    await response.WriteAsJsonAsync(error);
+}
 
 static string PlayerKey(HttpContext context) =>
     CurrentPlayer.TryGetId(context.User)?.ToString("N")

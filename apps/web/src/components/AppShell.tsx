@@ -61,9 +61,6 @@ export function AppShell() {
       <main className="app-main">
         <Outlet />
       </main>
-      <footer className="site-footer">
-        服务端权威裁定 · 双方独立视野 · 游客即刻开局
-      </footer>
     </div>
   )
 }

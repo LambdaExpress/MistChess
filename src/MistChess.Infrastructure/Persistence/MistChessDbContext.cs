@@ -38,15 +38,34 @@ public sealed class MistChessDbContext(DbContextOptions<MistChessDbContext> opti
     private static void ConfigureGuestSessions(ModelBuilder modelBuilder)
     {
         var entity = modelBuilder.Entity<GuestSessionEntity>();
-        entity.ToTable("guest_sessions", table => table.HasCheckConstraint("ck_guest_sessions_expiry", "expires_at > created_at"));
+        entity.ToTable("guest_sessions", table =>
+        {
+            table.HasCheckConstraint("ck_guest_sessions_expiry", "expires_at > created_at");
+            table.HasCheckConstraint(
+                "ck_guest_sessions_ban_state",
+                "(NOT is_banned AND banned_at IS NULL AND ban_reason IS NULL AND banned_by IS NULL) OR " +
+                "(is_banned AND banned_at IS NOT NULL AND ban_reason IS NOT NULL AND banned_by IS NOT NULL " +
+                "AND char_length(btrim(ban_reason)) BETWEEN 1 AND 200)");
+        });
         entity.HasKey(value => value.Id);
         entity.Property(value => value.Id).HasColumnName("id");
         entity.Property(value => value.TokenHash).HasColumnName("token_hash").HasMaxLength(64).IsRequired();
         entity.Property(value => value.DisplayName).HasColumnName("display_name").HasMaxLength(40).IsRequired();
         entity.Property(value => value.CreatedAt).HasColumnName("created_at");
         entity.Property(value => value.ExpiresAt).HasColumnName("expires_at");
+        entity.Property(value => value.IsBanned).HasColumnName("is_banned").HasDefaultValue(false);
+        entity.Property(value => value.BannedAt).HasColumnName("banned_at");
+        entity.Property(value => value.BanReason).HasColumnName("ban_reason").HasMaxLength(200);
+        entity.Property(value => value.BannedBy).HasColumnName("banned_by").HasMaxLength(64);
+        entity.Property(value => value.LastSeenAt).HasColumnName("last_seen_at");
         entity.HasIndex(value => value.TokenHash).IsUnique().HasDatabaseName("ux_guest_sessions_token_hash");
         entity.HasIndex(value => value.ExpiresAt).HasDatabaseName("ix_guest_sessions_expires_at");
+        entity.HasIndex(value => new { value.LastSeenAt, value.Id })
+            .IsDescending(true, true)
+            .HasDatabaseName("ix_guest_sessions_last_seen");
+        entity.HasIndex(value => new { value.IsBanned, value.LastSeenAt, value.Id })
+            .IsDescending(false, true, true)
+            .HasDatabaseName("ix_guest_sessions_ban_last_seen");
     }
 
     private static void ConfigureRooms(ModelBuilder modelBuilder)

@@ -25,6 +25,30 @@ export type ReplayShareCreated = components['schemas']['ReplayShareCreatedView']
 export type MoveRequest = components['schemas']['MoveRequest']
 export type GameResult = components['schemas']['GameResultView']
 
+export type AdminSession = components['schemas']['AdminSessionView']
+export type AdminLoginRequest = components['schemas']['AdminLoginRequest']
+export type AdminRating = components['schemas']['AdminRatingView']
+export type AdminUser = components['schemas']['AdminUserSummaryView']
+export type AdminUsersPage = components['schemas']['AdminUsersPageView']
+export type AdminUserDetail = components['schemas']['AdminUserDetailView']
+export type AdminBanStatus = components['schemas']['AdminBanStatusView']
+
+export type AdminUserStatus = 'all' | 'active' | 'banned'
+export type AdminOnlineStatus = 'all' | 'online' | 'offline'
+
+export type AdminUsersParams = {
+  query?: string
+  status?: AdminUserStatus
+  online?: AdminOnlineStatus
+  cursor?: string
+  limit?: number
+}
+
+export type AdminHistoricalGame = components['schemas']['AdminHistoricalGameSummaryView']
+export type AdminHistoricalGamesPage = components['schemas']['AdminHistoricalGamesPageView']
+export type AdminReplay = HistoricalReplay
+
+export const QUICK_MATCH_TIME_CONTROL_ID = '600+5'
 export const RULE_VERSION = 'fog-xiangqi-v1'
 export const QUICK_MATCH_CLIENT_REQUEST_ID_KEY = 'mistchess.quickMatch.clientRequestId'
 

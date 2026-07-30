@@ -37,12 +37,23 @@ const EVENT_PRIORITY: Record<SoundEvent, number> = {
   'game-loss': 3,
   'game-draw': 3,
 }
+const SOUND_ASSET: Record<SoundEvent, 'mistchess-tone' | 'move' | 'capture'> = {
+  'match-found': 'mistchess-tone',
+  'game-start': 'mistchess-tone',
+  'move-self': 'move',
+  'move-opponent': 'move',
+  capture: 'capture',
+  'clock-low': 'mistchess-tone',
+  'game-win': 'mistchess-tone',
+  'game-loss': 'mistchess-tone',
+  'game-draw': 'mistchess-tone',
+}
 const PLAYBACK_RATE: Record<SoundEvent, number> = {
   'match-found': 1.35,
   'game-start': 1.1,
   'move-self': 1,
-  'move-opponent': 0.88,
-  capture: 0.68,
+  'move-opponent': 1,
+  capture: 1,
   'clock-low': 1.55,
   'game-win': 1.3,
   'game-loss': 0.55,
@@ -164,7 +175,7 @@ export class AudioService {
 
   private createPlayer(event: SoundEvent) {
     const extension = this.extension ?? this.detectExtension()
-    const player = new Audio(`/audio/mistchess-tone.${extension}`)
+    const player = new Audio(`/audio/${SOUND_ASSET[event]}.${extension}`)
     player.preload = 'auto'
     player.dataset.soundEvent = event
     return player

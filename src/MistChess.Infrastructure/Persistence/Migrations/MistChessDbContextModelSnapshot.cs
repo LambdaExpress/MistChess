@@ -256,6 +256,20 @@ namespace MistChess.Infrastructure.Persistence.Migrations
                         .HasColumnType("uuid")
                         .HasColumnName("id");
 
+                    b.Property<string>("BanReason")
+                        .HasMaxLength(200)
+                        .HasColumnType("character varying(200)")
+                        .HasColumnName("ban_reason");
+
+                    b.Property<DateTimeOffset?>("BannedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("banned_at");
+
+                    b.Property<string>("BannedBy")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("banned_by");
+
                     b.Property<DateTimeOffset>("CreatedAt")
                         .HasColumnType("timestamp with time zone")
                         .HasColumnName("created_at");
@@ -269,6 +283,16 @@ namespace MistChess.Infrastructure.Persistence.Migrations
                     b.Property<DateTimeOffset>("ExpiresAt")
                         .HasColumnType("timestamp with time zone")
                         .HasColumnName("expires_at");
+
+                    b.Property<bool>("IsBanned")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("boolean")
+                        .HasDefaultValue(false)
+                        .HasColumnName("is_banned");
+
+                    b.Property<DateTimeOffset>("LastSeenAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("last_seen_at");
 
                     b.Property<string>("TokenHash")
                         .IsRequired()
@@ -285,8 +309,18 @@ namespace MistChess.Infrastructure.Persistence.Migrations
                         .IsUnique()
                         .HasDatabaseName("ux_guest_sessions_token_hash");
 
+                    b.HasIndex("LastSeenAt", "Id")
+                        .IsDescending()
+                        .HasDatabaseName("ix_guest_sessions_last_seen");
+
+                    b.HasIndex("IsBanned", "LastSeenAt", "Id")
+                        .IsDescending(false, true, true)
+                        .HasDatabaseName("ix_guest_sessions_ban_last_seen");
+
                     b.ToTable("guest_sessions", null, t =>
                         {
+                            t.HasCheckConstraint("ck_guest_sessions_ban_state", "(NOT is_banned AND banned_at IS NULL AND ban_reason IS NULL AND banned_by IS NULL) OR (is_banned AND banned_at IS NOT NULL AND ban_reason IS NOT NULL AND banned_by IS NOT NULL AND char_length(btrim(ban_reason)) BETWEEN 1 AND 200)");
+
                             t.HasCheckConstraint("ck_guest_sessions_expiry", "expires_at > created_at");
                         });
                 });

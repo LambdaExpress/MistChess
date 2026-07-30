@@ -151,6 +151,7 @@ public sealed class GameViewProjector(IGameStateSerializer stateSerializer, Time
         GameEndReason.AgreedDraw => GameResultReason.AgreedDraw.ToString(),
         GameEndReason.Repetition => GameResultReason.Repetition.ToString(),
         GameEndReason.NoProgress => GameResultReason.NoProgress.ToString(),
+        GameEndReason.AdministrativeForfeit => GameResultReason.AdministrativeForfeit.ToString(),
         _ => throw new ArgumentOutOfRangeException(nameof(reason))
     };
 

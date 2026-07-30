@@ -2,6 +2,8 @@
 
 中国迷雾象棋，后端使用 .NET 10，前端使用 React 19 与 Vite，开发数据库使用 PostgreSQL 18。第二阶段包含 `600+5` 动态 Elo 匹配、连续棋钟、音效、游客私有历史、三视野回放和可撤销分享链接。
 
+第三阶段的功能范围、数据口径、接口设计、安全要求和验收标准见 [`PHASE3_DEVELOPMENT.md`](PHASE3_DEVELOPMENT.md)。
+
 ## 准备环境
 
 安装 `global.json` 指定的 .NET SDK、`.nvmrc` 指定的 Node.js，以及 PostgreSQL 18（默认 `localhost:5432`）。确保 `pwsh`、`dotnet`、`node`、`npm.cmd` 和 `psql` 均已加入 `PATH`。
@@ -13,6 +15,21 @@
 运行仓库根目录的 `Start-MistChess.ps1`。脚本会检查开发工具、安装缺失的前端依赖，并应用待执行的 EF Core migrations。首次运行或 `.env` 密码与数据库角色不一致时，脚本会在当前窗口安全询问 PostgreSQL 管理员密码，然后创建或更新 `mistchess_app`、创建 `mistchess_dev` 并同步 `.env` 中的应用密码。输入的管理员密码不会显示。
 
 随后脚本会在两个独立的 PowerShell 窗口中启动 API 与前端，确认数据库和两个服务就绪后打开站点。默认仅监听 `http://127.0.0.1:5173`。
+
+管理员后台位于 `/admin`。本地开发先运行密码哈希工具；它只接受当前终端中的隐藏输入，不接受命令参数或管道输入，最终只输出 ASP.NET Core Identity 哈希：
+
+```powershell
+dotnet run --project tools/MistChess.AdminPasswordHash -c Release
+```
+
+复制输出的哈希，并把管理员用户名与哈希写入 API 项目的 .NET User Secrets。不要把管理员明文密码或生成后的哈希写入仓库：
+
+```powershell
+dotnet user-secrets set "Admin:Username" "<admin-username>" --project src/MistChess.Api
+dotnet user-secrets set "Admin:PasswordHash" "<generated-password-hash>" --project src/MistChess.Api
+```
+
+`Start-MistChess.ps1` 以 Development 环境启动 API，会自动读取这组 User Secrets。缺少任一项时管理员登录保持禁用，普通游客功能不受影响。
 
 如果 Windows 已将 `.ps1` 文件关联为 PowerShell 执行，可以直接双击脚本。Windows 默认文件关联可能会用编辑器打开 `.ps1`，此时请右键脚本并选择“使用 PowerShell 运行”，或在仓库根目录执行：
 
@@ -73,6 +90,16 @@ dotnet tool run dotnet-ef database update --project src/MistChess.Infrastructure
 npx --prefix apps/web playwright install chromium firefox
 ```
 
+完整浏览器套件包含管理员封禁与解封流程。运行前在当前 PowerShell 进程中设置专用测试管理员；用户名和哈希会传给 Playwright 启动的 API，明文密码只保留在 Playwright 进程中用于填写登录页，并会从 API 与 Vite 子进程环境中清除。E2E trace 已关闭，避免凭据进入失败产物：
+
+```powershell
+$env:MISTCHESS_E2E_ADMIN_USERNAME = "<e2e-admin-username>"
+$env:MISTCHESS_E2E_ADMIN_PASSWORD = "<e2e-admin-plaintext-password>"
+$env:MISTCHESS_E2E_ADMIN_PASSWORD_HASH = "<matching-generated-password-hash>"
+```
+
+这组凭据只用于本次测试，不要写入 `.env`、脚本或版本控制。测试已有部署时只需提供用户名和明文密码，并确保目标 API 已配置相同账号。
+
 按上文设置测试维护连接字符串后，执行完整验证：
 
 ```powershell
@@ -82,7 +109,7 @@ npm test --prefix apps/web
 npm run e2e --prefix apps/web
 ```
 
-Playwright 会自动启动开发 API 与 Vite，并在桌面 Chromium、Firefox 和 Pixel 5 移动 Chromium 三个项目中运行。用已有同源部署做冒烟测试时，设置 `MISTCHESS_E2E_BASE_URL`；此时 Playwright 不会启动开发服务器。
+Playwright 会先应用待执行的数据库 migrations，再自动启动开发 API 与 Vite，并在桌面 Chromium、Firefox 和 Pixel 5 移动 Chromium 三个项目中运行。它默认拒绝复用已有的 5052/5173 服务，避免误连旧代码或错误数据库；只有明确设置 `MISTCHESS_E2E_REUSE_SERVERS=1` 时才会复用。用已有同源部署做冒烟测试时，设置 `MISTCHESS_E2E_BASE_URL`；此时 Playwright 不会启动开发服务器。
 
 ## 生产发布
 
@@ -98,6 +125,8 @@ dotnet publish src/MistChess.Api/MistChess.Api.csproj -c Release -o artifacts/pu
 
 后端发布目标会校验前端 `dist` 是否存在，并把静态资源组合进 `wwwroot`。生产环境使用进程级 `ConnectionStrings__MistChess`，不使用开发机 user-secrets。
 
+管理员密码哈希可使用上文的 `MistChess.AdminPasswordHash` 工具生成。生产环境必须从服务管理器或密钥存储向进程注入 `Admin__Username` 与 `Admin__PasswordHash`；不要把管理员明文密码、哈希或生产连接字符串写入发布目录、脚本或版本控制。
+
 ### Kestrel 直接终止 TLS
 
 在发布输出目录设置 HTTPS 监听、证书和唯一允许的前端 Origin，然后启动进程。`WebSockets__AllowedOrigins__0` 必须是浏览器访问站点的精确 `scheme://host[:port]`，不能包含路径：
@@ -109,6 +138,8 @@ $env:ASPNETCORE_URLS = "https://0.0.0.0:8443"
 $env:Kestrel__Certificates__Default__Path = "C:\certs\mistchess.pfx"
 $env:Kestrel__Certificates__Default__Password = "<certificate-password>"
 $env:WebSockets__AllowedOrigins__0 = "https://chess.example.com:8443"
+$env:Admin__Username = "<admin-username>"
+$env:Admin__PasswordHash = "<generated-password-hash>"
 dotnet MistChess.Api.dll
 ```
 
@@ -121,6 +152,8 @@ Set-Location artifacts/publish/api
 $env:ConnectionStrings__MistChess = "<production-connection-string>"
 $env:ASPNETCORE_URLS = "http://127.0.0.1:5000"
 $env:WebSockets__AllowedOrigins__0 = "https://chess.example.com"
+$env:Admin__Username = "<admin-username>"
+$env:Admin__PasswordHash = "<generated-password-hash>"
 dotnet MistChess.Api.dll
 ```
 

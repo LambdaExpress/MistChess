@@ -44,6 +44,7 @@ const resultReasons: Record<GameResult['reason'], string> = {
   agreedDraw: '双方同意和棋',
   repetition: '三次重复局面',
   noProgress: '一百二十回合无进展',
+  administrativeForfeit: '管理员判负',
 }
 
 type ClockSnapshot = {

@@ -8,13 +8,16 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using MistChess.Api.Application;
+using MistChess.Api.Security;
 
 namespace MistChess.Api.Tests.Infrastructure;
 
 public sealed class MistChessWebApplicationFactory(
     string connectionString,
     bool runBackgroundWorkers = false,
-    bool useTestAuthentication = false) : WebApplicationFactory<Program>
+    bool useTestAuthentication = false,
+    IReadOnlyDictionary<string, string?>? settings = null,
+    TimeProvider? timeProvider = null) : WebApplicationFactory<Program>
 {
     public static MistChessWebApplicationFactory WithoutDatabase(bool authenticated = false) => new(
         "Host=127.0.0.1;Port=1;Database=mistchess_unavailable;Username=mistchess_unavailable;Password=unavailable;Timeout=1;Command Timeout=1",
@@ -23,6 +26,13 @@ public sealed class MistChessWebApplicationFactory(
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
         builder.UseSetting("ConnectionStrings:MistChess", connectionString);
+        if (settings is not null)
+        {
+            foreach (var (key, value) in settings)
+            {
+                builder.UseSetting(key, value);
+            }
+        }
         builder.UseEnvironment("Testing");
         if (!runBackgroundWorkers)
         {
@@ -39,6 +49,22 @@ public sealed class MistChessWebApplicationFactory(
                 }
             });
         }
+        if (timeProvider is not null)
+        {
+            builder.ConfigureServices(services =>
+            {
+                var registrations = services
+                    .Where(descriptor => descriptor.ServiceType == typeof(TimeProvider))
+                    .ToArray();
+                foreach (var registration in registrations)
+                {
+                    services.Remove(registration);
+                }
+
+                services.AddSingleton(timeProvider);
+            });
+        }
+
         if (useTestAuthentication)
         {
             builder.ConfigureServices(services =>
@@ -75,7 +101,10 @@ public sealed class TestAuthenticationHandler(
     protected override Task<AuthenticateResult> HandleAuthenticateAsync()
     {
         var identity = new ClaimsIdentity(
-            [new Claim(ClaimTypes.NameIdentifier, PlayerId.ToString("D"))],
+            [
+                new Claim(ClaimTypes.NameIdentifier, PlayerId.ToString("D")),
+                new Claim(MistChessClaims.PrincipalKind, MistChessClaims.GuestPrincipal)
+            ],
             AuthenticationSchemeName);
         var ticket = new AuthenticationTicket(new ClaimsPrincipal(identity), AuthenticationSchemeName);
         return Task.FromResult(AuthenticateResult.Success(ticket));

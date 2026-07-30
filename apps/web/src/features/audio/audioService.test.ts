@@ -4,6 +4,7 @@ import { AudioService } from './audioService'
 class FakeAudio {
   static instances: FakeAudio[] = []
   static rejectPlayback = false
+  static supportsOgg = true
 
   readonly dataset: Record<string, string> = {}
   readonly src: string
@@ -21,8 +22,8 @@ class FakeAudio {
     FakeAudio.instances.push(this)
   }
 
-  canPlayType() {
-    return 'probably'
+  canPlayType(type: string) {
+    return type.startsWith('audio/ogg') && FakeAudio.supportsOgg ? 'probably' : ''
   }
 }
 
@@ -35,6 +36,7 @@ beforeEach(() => {
   localStorage.clear()
   FakeAudio.instances = []
   FakeAudio.rejectPlayback = false
+  FakeAudio.supportsOgg = true
   vi.stubGlobal('Audio', FakeAudio)
 })
 
@@ -63,6 +65,36 @@ describe('AudioService', () => {
     expect(FakeAudio.instances).toHaveLength(3)
   })
 
+  it('maps move and capture events to distinct Ogg assets at normal playback rate', async () => {
+    const service = new AudioService()
+    await service.unlock()
+
+    service.emit('game-assets', 1, 'move-self')
+    service.emit('game-assets', 2, 'move-opponent')
+    service.emit('game-assets', 3, 'capture')
+    await flushTransitions()
+
+    const played = FakeAudio.instances.filter((player) => player.play.mock.calls.length > 0)
+    expect(played.slice(-3).map((player) => player.src)).toEqual([
+      '/audio/move.ogg',
+      '/audio/move.ogg',
+      '/audio/capture.ogg',
+    ])
+    expect(played.slice(-3).map((player) => player.playbackRate)).toEqual([1, 1, 1])
+  })
+
+  it('falls back to MP3 when Ogg Vorbis is unavailable', async () => {
+    FakeAudio.supportsOgg = false
+    const service = new AudioService()
+    await service.unlock()
+
+    service.emit('game-mp3', 1, 'capture')
+    await flushTransitions()
+
+    expect(FakeAudio.instances.at(-1)?.src).toBe('/audio/capture.mp3')
+    expect(FakeAudio.instances.at(-1)?.playbackRate).toBe(1)
+  })
+
   it('keeps only the highest-priority sound for one authoritative transition', async () => {
     const service = new AudioService()
     await service.unlock()
@@ -74,6 +106,22 @@ describe('AudioService', () => {
 
     expect(FakeAudio.instances).toHaveLength(3)
     expect(FakeAudio.instances[2].dataset.soundEvent).toBe('game-win')
+  })
+
+  it('prefers capture over a move for the same authoritative transition', async () => {
+    const service = new AudioService()
+    await service.unlock()
+
+    service.emit('game-capture-priority', 3, 'move-self')
+    service.emit('game-capture-priority', 3, 'capture')
+    await flushTransitions()
+
+    const played = FakeAudio.instances.filter(
+      (player) => player.volume > 0 && player.play.mock.calls.length > 0,
+    )
+    expect(played).toHaveLength(1)
+    expect(played[0].dataset.soundEvent).toBe('capture')
+    expect(played[0].src).toBe('/audio/capture.ogg')
   })
 
   it('clamps persisted volume and isolates playback failures', async () => {

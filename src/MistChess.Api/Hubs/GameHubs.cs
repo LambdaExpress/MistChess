@@ -13,6 +13,7 @@ public static class HubGroups
 {
     public static string LobbyPlayer(Guid playerId) => $"player:{playerId:N}";
     public static string GamePlayer(Guid gameId, Guid playerId) => $"game:{gameId:N}:player:{playerId:N}";
+    public static string GameAccount(Guid playerId) => $"game-account:{playerId:N}";
 }
 
 [Authorize]
@@ -57,7 +58,9 @@ public sealed class GameHub(
 
         Context.Items[nameof(GameEntity.Id)] = game.Id;
         Context.Items[nameof(CurrentPlayer)] = playerId;
-        await Groups.AddToGroupAsync(Context.ConnectionId, HubGroups.GamePlayer(game.Id, playerId));
+        await Task.WhenAll(
+            Groups.AddToGroupAsync(Context.ConnectionId, HubGroups.GamePlayer(game.Id, playerId)),
+            Groups.AddToGroupAsync(Context.ConnectionId, HubGroups.GameAccount(playerId)));
         var opponentId = game.RedPlayerId == playerId ? game.BlackPlayerId : game.RedPlayerId;
         var firstConnection = connections.Connect(game.Id, playerId, Context.ConnectionId);
         await Clients.Caller
@@ -185,6 +188,28 @@ public sealed class SignalRLobbyNotifier(IHubContext<LobbyHub> hubContext) : ILo
     public Task MatchFoundAsync(Guid playerId, MatchFoundView match, CancellationToken cancellationToken) =>
         hubContext.Clients.Group(HubGroups.LobbyPlayer(playerId))
             .SendAsync("MatchFound", match, cancellationToken);
+}
+
+public sealed class SignalRAccountNotifier(
+    IHubContext<LobbyHub> lobbyHubContext,
+    IHubContext<GameHub> gameHubContext) : IAccountNotifier
+{
+    public async Task AccountBannedAsync(
+        Guid playerId,
+        Guid? gameId,
+        string reason,
+        CancellationToken cancellationToken)
+    {
+        var payload = new AccountBannedView(reason);
+        var lobbyNotification = lobbyHubContext.Clients
+            .Group(HubGroups.LobbyPlayer(playerId))
+            .SendAsync("AccountBanned", payload, cancellationToken);
+        await Task.WhenAll(
+            lobbyNotification,
+            gameHubContext.Clients
+                .Group(HubGroups.GameAccount(playerId))
+                .SendAsync("AccountBanned", payload, cancellationToken));
+    }
 }
 
 public sealed class SignalRGameNotifier(

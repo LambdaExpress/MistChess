@@ -25,6 +25,11 @@ public sealed class GuestSessionEntity
     public required string DisplayName { get; set; }
     public DateTimeOffset CreatedAt { get; set; }
     public DateTimeOffset ExpiresAt { get; set; }
+    public bool IsBanned { get; set; }
+    public DateTimeOffset? BannedAt { get; set; }
+    public string? BanReason { get; set; }
+    public string? BannedBy { get; set; }
+    public DateTimeOffset LastSeenAt { get; set; }
 }
 
 public sealed class RoomEntity

@@ -32,6 +32,12 @@ public sealed class ApiException : Exception
         "NOT_FOUND",
         "The requested resource was not found.");
 
+    public static ApiException PlayerBanned(string? reason = null) => new(
+        StatusCodes.Status403Forbidden,
+        "PLAYER_BANNED",
+        "This player is banned.",
+        reason);
+
     public static ApiException Conflict(string code, string title, Guid? gameId = null) => new(
         StatusCodes.Status409Conflict,
         code,

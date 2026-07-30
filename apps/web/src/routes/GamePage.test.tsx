@@ -178,6 +178,53 @@ describe('GamePage recovery and commands', () => {
     expect(getGame).toHaveBeenCalledTimes(2)
   })
 
+  it('emits move, capture, and terminal audio with authoritative priority', async () => {
+    vi.spyOn(api, 'getGame').mockResolvedValue(snapshot())
+    const emit = vi.spyOn(audioService, 'emit')
+
+    renderGamePage()
+    await screen.findByRole('heading', { name: '轮到你行棋' })
+    await waitFor(() => expect(emit).toHaveBeenCalledWith('game-1', 8, 'game-start'))
+    emit.mockClear()
+
+    act(() => {
+      gameHubHandlers?.onView(snapshot({ version: 9, sideToMove: 'black' }))
+    })
+    await waitFor(() => {
+      expect(emit).toHaveBeenCalledWith('game-1', 9, 'move-self')
+    })
+    expect(emit).toHaveBeenCalledTimes(1)
+    emit.mockClear()
+
+    act(() => {
+      gameHubHandlers?.onView(snapshot({
+        version: 10,
+        sideToMove: 'red',
+        captureSummary: { redLost: [], blackLost: ['rook'] },
+      }))
+    })
+    await waitFor(() => {
+      expect(emit).toHaveBeenCalledWith('game-1', 10, 'capture')
+    })
+    expect(emit).toHaveBeenCalledTimes(1)
+    emit.mockClear()
+
+    act(() => {
+      gameHubHandlers?.onView(snapshot({
+        version: 11,
+        status: 'finished',
+        result: { winner: 'red', reason: 'generalCaptured' },
+        sideToMove: 'black',
+        captureSummary: { redLost: [], blackLost: ['rook', 'general'] },
+        candidateMoves: [],
+      }))
+    })
+    await waitFor(() => {
+      expect(emit).toHaveBeenCalledWith('game-1', 11, 'game-win')
+    })
+    expect(emit).toHaveBeenCalledTimes(1)
+  })
+
   it('plays each low-clock threshold only once after recalibration', async () => {
     const initial = snapshot({
       clock: {

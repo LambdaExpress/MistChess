@@ -1,5 +1,15 @@
 import type { components, operations } from './schema'
-import { RULE_VERSION } from './types'
+import {
+  RULE_VERSION,
+  type AdminBanStatus,
+  type AdminHistoricalGamesPage,
+  type AdminLoginRequest,
+  type AdminReplay,
+  type AdminSession,
+  type AdminUserDetail,
+  type AdminUsersPage,
+  type AdminUsersParams,
+} from './types'
 
 type ApiProblem = components['schemas']['ErrorResponse'] & Record<string, unknown>
 
@@ -15,7 +25,10 @@ type JsonRequest<TOperation extends keyof operations> =
     ? TRequest
     : never
 
-let antiforgeryTokenPromise: Promise<JsonResponse<'getAntiforgeryToken'>> | undefined
+type AntiforgeryToken = { token: string; headerName: string }
+
+let antiforgeryTokenPromise: Promise<AntiforgeryToken> | undefined
+let adminAntiforgeryTokenPromise: Promise<AntiforgeryToken> | undefined
 
 export class ApiError extends Error {
   readonly status: number
@@ -31,27 +44,35 @@ export class ApiError extends Error {
   }
 }
 
-async function getAntiforgeryToken(): Promise<JsonResponse<'getAntiforgeryToken'>> {
-  antiforgeryTokenPromise ??= requestJson<'getAntiforgeryToken'>('/api/antiforgery/token')
+async function getAntiforgeryToken(admin: boolean): Promise<AntiforgeryToken> {
+  const current = admin ? adminAntiforgeryTokenPromise : antiforgeryTokenPromise
+  const pending = current ?? request<AntiforgeryToken>(
+    admin ? '/api/admin/antiforgery/token' : '/api/antiforgery/token',
+  )
+  if (admin) adminAntiforgeryTokenPromise = pending
+  else antiforgeryTokenPromise = pending
+
   try {
-    return await antiforgeryTokenPromise
+    return await pending
   } catch (error) {
-    antiforgeryTokenPromise = undefined
+    if (admin) adminAntiforgeryTokenPromise = undefined
+    else antiforgeryTokenPromise = undefined
     throw error
   }
 }
 
-async function requestJson<TOperation extends keyof operations>(
+async function request<TResponse>(
   path: string,
   init?: RequestInit,
-): Promise<JsonResponse<TOperation>> {
+): Promise<TResponse> {
   const headers = new Headers(init?.headers)
   const method = (init?.method ?? 'GET').toUpperCase()
+  const adminRequest = path.startsWith('/api/admin/')
   headers.set('Accept', 'application/json')
   headers.set('X-Requested-With', 'MistChess')
   if (init?.body) headers.set('Content-Type', 'application/json')
   if (!['GET', 'HEAD', 'OPTIONS'].includes(method) && path !== '/api/sessions/guest') {
-    const antiforgery = await getAntiforgeryToken()
+    const antiforgery = await getAntiforgeryToken(adminRequest)
     headers.set(antiforgery.headerName, antiforgery.token)
   }
 
@@ -62,13 +83,6 @@ async function requestJson<TOperation extends keyof operations>(
   })
 
   if (!response.ok) {
-    if (
-      response.status === 401 &&
-      path !== '/api/sessions/guest' &&
-      typeof window !== 'undefined'
-    ) {
-      window.dispatchEvent(new Event('mistchess:session-invalid'))
-    }
     let problem: ApiProblem = {
       code: 'REQUEST_FAILED',
       title: response.statusText || 'Request failed',
@@ -78,11 +92,31 @@ async function requestJson<TOperation extends keyof operations>(
     } catch {
       // The HTTP status remains sufficient when a proxy returns a non-JSON error page.
     }
+
+    if (typeof window !== 'undefined') {
+      if (!adminRequest && problem.code === 'PLAYER_BANNED') {
+        window.dispatchEvent(new CustomEvent<string>('mistchess:account-banned', {
+          detail: typeof problem.detail === 'string' ? problem.detail : '',
+        }))
+      } else if (response.status === 401 && adminRequest) {
+        adminAntiforgeryTokenPromise = undefined
+        window.dispatchEvent(new Event('mistchess:admin-session-invalid'))
+      } else if (response.status === 401 && path !== '/api/sessions/guest') {
+        window.dispatchEvent(new Event('mistchess:session-invalid'))
+      }
+    }
     throw new ApiError(response.status, problem)
   }
 
-  if (response.status === 204) return undefined as JsonResponse<TOperation>
-  return (await response.json()) as JsonResponse<TOperation>
+  if (response.status === 204) return undefined as TResponse
+  return (await response.json()) as TResponse
+}
+
+async function requestJson<TOperation extends keyof operations>(
+  path: string,
+  init?: RequestInit,
+): Promise<JsonResponse<TOperation>> {
+  return request<JsonResponse<TOperation>>(path, init)
 }
 
 function jsonBody<T>(value: T): string {
@@ -90,8 +124,73 @@ function jsonBody<T>(value: T): string {
 }
 
 export const api = {
+  getAdminSession: () =>
+    request<AdminSession>('/api/admin/session'),
+
+  loginAdmin: async (credentials: AdminLoginRequest) => {
+    adminAntiforgeryTokenPromise = undefined
+    const session = await request<AdminSession>('/api/admin/session', {
+      method: 'POST',
+      body: jsonBody(credentials),
+    })
+    adminAntiforgeryTokenPromise = undefined
+    return session
+  },
+
+  logoutAdmin: async () => {
+    try {
+      await request<void>('/api/admin/session', { method: 'DELETE' })
+    } finally {
+      adminAntiforgeryTokenPromise = undefined
+    }
+  },
+
+  getAdminUsers: (params: AdminUsersParams) => {
+    const search = new URLSearchParams()
+    if (params.query) search.set('query', params.query)
+    if (params.status && params.status !== 'all') search.set('status', params.status)
+    if (params.online && params.online !== 'all') search.set('online', params.online)
+    if (params.cursor) search.set('cursor', params.cursor)
+    if (params.limit) search.set('limit', params.limit.toString())
+    const query = search.size ? `?${search.toString()}` : ''
+    return request<AdminUsersPage>(`/api/admin/users${query}`)
+  },
+
+  getAdminUser: (playerId: string) =>
+    request<AdminUserDetail>(`/api/admin/users/${encodeURIComponent(playerId)}`),
+
+  banAdminUser: (playerId: string, reason: string) =>
+    request<AdminBanStatus>(`/api/admin/users/${encodeURIComponent(playerId)}/ban`, {
+      method: 'POST',
+      body: jsonBody({ reason }),
+    }),
+
+  unbanAdminUser: (playerId: string) =>
+    request<AdminBanStatus>(`/api/admin/users/${encodeURIComponent(playerId)}/ban`, {
+      method: 'DELETE',
+    }),
+
+  getAdminUserGames: (
+    playerId: string,
+    params: { cursor?: string; limit?: number },
+  ) => {
+    const search = new URLSearchParams()
+    if (params.cursor) search.set('cursor', params.cursor)
+    if (params.limit) search.set('limit', params.limit.toString())
+    const query = search.size ? `?${search.toString()}` : ''
+    return request<AdminHistoricalGamesPage>(
+      `/api/admin/users/${encodeURIComponent(playerId)}/games${query}`,
+    )
+  },
+
+  getAdminReplay: (gameId: string) =>
+    request<AdminReplay>(`/api/admin/games/${encodeURIComponent(gameId)}/replay`),
+
   startGuestSession: () =>
     requestJson<'createGuestSession'>('/api/sessions/guest', { method: 'POST' }),
+
+  heartbeatSession: () =>
+    requestJson<'heartbeatGuestSession'>('/api/sessions/heartbeat', { method: 'POST' }),
 
   getGameOptions: () =>
     requestJson<'getGameOptions'>('/api/game-options'),

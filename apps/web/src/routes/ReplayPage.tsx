@@ -31,6 +31,7 @@ const reasonNames: Record<GameResult['reason'], string> = {
   agreedDraw: '协议和棋',
   repetition: '重复局面和棋',
   noProgress: '无进展和棋',
+  administrativeForfeit: '管理员判负',
 }
 const pieceNames: Record<Side, Record<PieceType, string>> = {
   red: { general: '帅', advisor: '仕', elephant: '相', horse: '马', rook: '车', cannon: '炮', pawn: '兵' },
