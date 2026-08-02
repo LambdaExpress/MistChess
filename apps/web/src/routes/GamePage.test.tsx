@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { MemoryRouter, Route, Routes } from 'react-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError, api } from '../api/client'
@@ -10,6 +10,7 @@ import {
   type GameView,
   type GuestSession,
   type MatchTicket,
+  type TakebackRequestView,
 } from '../api/types'
 import { interpolateClock } from '../features/game/clock'
 import { audioService } from '../features/audio/audioService'
@@ -46,6 +47,26 @@ function snapshot(overrides: Partial<GameView> = {}): GameView {
     captureSummary: { redLost: [], blackLost: [] },
     clock: null,
     drawOffer: null,
+    negotiationVersion: 0,
+    takebackRequest: null,
+    lastAction: null,
+    canRequestTakeback: false,
+    ...overrides,
+  }
+}
+
+function pendingTakeback(
+  overrides: Partial<TakebackRequestView> = {},
+): TakebackRequestView {
+  return {
+    id: 'takeback-1',
+    status: 'pending',
+    requestedBy: 'black',
+    requestedPly: 3,
+    requestedAtVersion: 8,
+    resolvedAtVersion: null,
+    createdAt: '2026-07-31T00:00:00Z',
+    revision: 1,
     ...overrides,
   }
 }
@@ -119,7 +140,13 @@ describe('GamePage recovery and commands', () => {
   it('recovers a missed equal-version draw offer through the HTTP refetch callback', async () => {
     const current = snapshot()
     const recovered = snapshot({
-      drawOffer: { offeredBy: 'black', status: 'pending' },
+      drawOffer: {
+        id: 'draw-recovered',
+        offeredBy: 'black',
+        status: 'pending',
+        revision: 1,
+      },
+      negotiationVersion: 1,
       clock: {
         redMilliseconds: 42_000,
         blackMilliseconds: 21_000,
@@ -138,7 +165,8 @@ describe('GamePage recovery and commands', () => {
       gameHubHandlers?.onReconnect()
     })
 
-    expect(await screen.findByRole('alert')).toHaveTextContent('对手提议和棋')
+    expect(await screen.findByRole('alertdialog', { name: '对手提议和棋' }))
+      .toBeInTheDocument()
     expect(screen.getByText('00:42')).toBeInTheDocument()
     expect(screen.getByText('00:21')).toBeInTheDocument()
     expect(getGame).toHaveBeenCalledTimes(2)
@@ -178,36 +206,41 @@ describe('GamePage recovery and commands', () => {
     expect(getGame).toHaveBeenCalledTimes(2)
   })
 
-  it('emits move, capture, and terminal audio with authoritative priority', async () => {
+  it('emits both players authoritative moves once and preserves capture-terminal order', async () => {
     vi.spyOn(api, 'getGame').mockResolvedValue(snapshot())
-    const emit = vi.spyOn(audioService, 'emit')
+    const emitLive = vi.spyOn(audioService, 'emitLive')
 
     renderGamePage()
     await screen.findByRole('heading', { name: '轮到你行棋' })
-    await waitFor(() => expect(emit).toHaveBeenCalledWith('game-1', 8, 'game-start'))
-    emit.mockClear()
+    expect(emitLive).not.toHaveBeenCalled()
 
+    const ownMove = snapshot({
+      version: 9,
+      sideToMove: 'black',
+      lastAction: { version: 9, kind: 'move', actor: 'red' },
+    })
     act(() => {
-      gameHubHandlers?.onView(snapshot({ version: 9, sideToMove: 'black' }))
+      gameHubHandlers?.onView(ownMove)
+      gameHubHandlers?.onView(ownMove)
+      gameHubHandlers?.onSnapshot?.(ownMove)
     })
     await waitFor(() => {
-      expect(emit).toHaveBeenCalledWith('game-1', 9, 'move-self')
+      expect(emitLive).toHaveBeenCalledWith('game-1', 9, ['move-self'])
     })
-    expect(emit).toHaveBeenCalledTimes(1)
-    emit.mockClear()
+    expect(emitLive).toHaveBeenCalledTimes(1)
+    emitLive.mockClear()
 
     act(() => {
       gameHubHandlers?.onView(snapshot({
         version: 10,
         sideToMove: 'red',
-        captureSummary: { redLost: [], blackLost: ['rook'] },
+        lastAction: { version: 10, kind: 'move', actor: 'black' },
       }))
     })
     await waitFor(() => {
-      expect(emit).toHaveBeenCalledWith('game-1', 10, 'capture')
+      expect(emitLive).toHaveBeenCalledWith('game-1', 10, ['move-opponent'])
     })
-    expect(emit).toHaveBeenCalledTimes(1)
-    emit.mockClear()
+    emitLive.mockClear()
 
     act(() => {
       gameHubHandlers?.onView(snapshot({
@@ -215,14 +248,24 @@ describe('GamePage recovery and commands', () => {
         status: 'finished',
         result: { winner: 'red', reason: 'generalCaptured' },
         sideToMove: 'black',
-        captureSummary: { redLost: [], blackLost: ['rook', 'general'] },
+        captureSummary: { redLost: [], blackLost: ['general'] },
         candidateMoves: [],
+        lastAction: { version: 11, kind: 'capture', actor: 'red' },
       }))
     })
     await waitFor(() => {
-      expect(emit).toHaveBeenCalledWith('game-1', 11, 'game-win')
+      expect(emitLive).toHaveBeenCalledWith('game-1', 11, ['capture', 'game-win'])
     })
-    expect(emit).toHaveBeenCalledTimes(1)
+    emitLive.mockClear()
+
+    act(() => {
+      gameHubHandlers?.onView(snapshot({
+        version: 12,
+        sideToMove: 'red',
+        lastAction: { version: 12, kind: 'takebackAccepted', actor: 'black' },
+      }))
+    })
+    expect(emitLive).not.toHaveBeenCalled()
   })
 
   it('plays each low-clock threshold only once after recalibration', async () => {
@@ -273,7 +316,9 @@ describe('GamePage recovery and commands', () => {
 
     renderGamePage()
 
-    expect(await screen.findByText('本步 01:30')).toBeInTheDocument()
+    const ownClock = await screen.findByLabelText('我方红方计时')
+    expect(within(ownClock).getByText('本步')).toBeInTheDocument()
+    expect(within(ownClock).getByText('01:30')).toBeInTheDocument()
     expect(screen.getAllByText('10:00')).toHaveLength(2)
   })
 
@@ -287,7 +332,12 @@ describe('GamePage recovery and commands', () => {
     const resign = vi.spyOn(api, 'resignGame').mockReturnValue(resignResponse)
     const offerDraw = vi
       .spyOn(api, 'offerDraw')
-      .mockResolvedValue({ offeredBy: 'red', status: 'pending' })
+      .mockResolvedValue({
+        id: 'draw-1',
+        offeredBy: 'red',
+        status: 'pending',
+        revision: 1,
+      })
 
     renderGamePage()
     await screen.findByRole('heading', { name: '轮到你行棋' })
@@ -312,6 +362,142 @@ describe('GamePage recovery and commands', () => {
 
     fireEvent.click(drawButton)
     await waitFor(() => expect(offerDraw).toHaveBeenCalledOnce())
+    const waitingDraw = await screen.findByRole('status', { name: '已提议和棋' })
+    expect(waitingDraw.closest('.game-board-stage')).not.toBeNull()
+    expect(within(waitingDraw).queryByRole('button')).not.toBeInTheDocument()
+  })
+
+  it('shows incoming draw and takeback requests in the board overlay', async () => {
+    vi.spyOn(api, 'getGame').mockResolvedValue(snapshot())
+
+    const { container } = renderGamePage()
+    await screen.findByRole('heading', { name: '轮到你行棋' })
+
+    act(() => {
+      gameHubHandlers?.onDrawOffer({
+        id: 'draw-1',
+        offeredBy: 'black',
+        status: 'pending',
+        revision: 1,
+      })
+    })
+    const drawDialog = await screen.findByRole('alertdialog', {
+      name: '对手提议和棋',
+    })
+    expect(drawDialog.closest('.game-board-stage')).not.toBeNull()
+    expect(screen.getByRole('button', { name: '同意' })).toHaveFocus()
+
+    act(() => {
+      gameHubHandlers?.onDrawOffer({
+        id: 'draw-1',
+        offeredBy: 'black',
+        status: 'rejected',
+        revision: 2,
+      })
+      gameHubHandlers?.onTakebackRequest?.(pendingTakeback({ revision: 3 }))
+    })
+    const takebackDialog = await screen.findByRole('alertdialog', {
+      name: '对手请求悔棋',
+    })
+    expect(takebackDialog.closest('.game-board-stage')).not.toBeNull()
+    expect(takebackDialog).toHaveTextContent('对手请求撤销第 3 手')
+    expect(screen.getByRole('button', { name: '同意' })).toHaveFocus()
+
+    act(() => {
+      gameHubHandlers?.onTakebackRequest?.(pendingTakeback({
+        status: 'rejected',
+        revision: 4,
+        resolvedAtVersion: 8,
+      }))
+      gameHubHandlers?.onTakebackRequest?.(pendingTakeback({
+        id: 'takeback-own',
+        requestedBy: 'red',
+        revision: 5,
+      }))
+    })
+    const waiting = await screen.findByRole('status', { name: '已请求悔棋' })
+    expect(waiting.closest('.game-board-stage')).not.toBeNull()
+    expect(within(waiting).queryByRole('button')).not.toBeInTheDocument()
+    expect(container.querySelectorAll('.game-negotiation-overlay')).toHaveLength(1)
+  })
+
+  it('places the opponent clock above the board and the player clock below it', async () => {
+    vi.spyOn(api, 'getGame').mockResolvedValue(snapshot({
+      perspective: 'black',
+      sideToMove: 'red',
+      clock: {
+        redMilliseconds: 120_000,
+        blackMilliseconds: 180_000,
+        serverTime: new Date().toISOString(),
+        turnMilliseconds: 60_000,
+      },
+    }))
+
+    const { container } = renderGamePage()
+    const opponentClock = await screen.findByRole('region', {
+      name: '对方红方计时',
+    })
+    const playerClock = screen.getByRole('region', { name: '我方黑方计时' })
+    const boardStage = container.querySelector('.game-board-stage')
+
+    expect(boardStage).not.toBeNull()
+    expect(opponentClock.compareDocumentPosition(boardStage!) & Node.DOCUMENT_POSITION_FOLLOWING)
+      .toBeTruthy()
+    expect(boardStage!.compareDocumentPosition(playerClock) & Node.DOCUMENT_POSITION_FOLLOWING)
+      .toBeTruthy()
+    expect(within(opponentClock).getByText('02:00')).toBeInTheDocument()
+    expect(within(playerClock).getByText('03:00')).toBeInTheDocument()
+  })
+
+  it('offers takeback only when the authoritative view grants eligibility', async () => {
+    vi.spyOn(api, 'getGame').mockResolvedValue(snapshot())
+    const createTakebackRequest = vi.spyOn(api, 'createTakebackRequest')
+      .mockResolvedValue(pendingTakeback({
+        requestedBy: 'red',
+        requestedAtVersion: 9,
+        revision: 1,
+      }))
+
+    renderGamePage()
+    await screen.findByRole('heading', { name: '轮到你行棋' })
+    expect(screen.queryByRole('button', { name: '请求悔棋' })).not.toBeInTheDocument()
+
+    act(() => {
+      gameHubHandlers?.onView(snapshot({
+        version: 9,
+        sideToMove: 'black',
+        canRequestTakeback: true,
+        lastAction: { version: 9, kind: 'move', actor: 'red' },
+      }))
+    })
+    const actionCard = screen.getByRole('heading', { name: '对局操作' }).parentElement
+    expect(actionCard).toHaveClass('action-card')
+    expect(within(actionCard!).getByRole('button', { name: '提议和棋' })).toBeInTheDocument()
+    expect(within(actionCard!).getByRole('button', { name: '认输' })).toBeInTheDocument()
+    const takebackButton = await screen.findByRole('button', { name: '请求悔棋' })
+    expect(takebackButton.closest('.action-card')).toBe(actionCard)
+    fireEvent.click(takebackButton)
+
+    await waitFor(() => {
+      expect(createTakebackRequest).toHaveBeenCalledWith('game-1', {
+        expectedVersion: 9,
+        clientRequestId: expect.any(String),
+      })
+    })
+    expect(await screen.findByRole('status', { name: '已请求悔棋' }))
+      .toBeInTheDocument()
+  })
+
+  it('does not render internal connection or version copy', async () => {
+    vi.spyOn(api, 'getGame').mockResolvedValue(snapshot())
+
+    const { container } = renderGamePage()
+    await screen.findByRole('heading', { name: '轮到你行棋' })
+
+    expect(container.querySelector('.game-connection')).not.toBeInTheDocument()
+    expect(screen.queryByText(/LIVE GAME/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/^局面版本/)).not.toBeInTheDocument()
+    expect(screen.queryByText('实时同步')).not.toBeInTheDocument()
   })
 
   it('recovers an active ticket when a result-page rematch response was lost', async () => {

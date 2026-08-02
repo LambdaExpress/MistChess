@@ -12,6 +12,10 @@ public interface IGameNotifier
 {
     Task GameUpdatedAsync(Guid gameId, bool ended, CancellationToken cancellationToken);
     Task DrawOfferChangedAsync(Guid gameId, DrawOfferView offer, CancellationToken cancellationToken);
+    Task TakebackRequestChangedAsync(
+        Guid gameId,
+        TakebackRequestView request,
+        CancellationToken cancellationToken);
 }
 
 public interface IAccountNotifier

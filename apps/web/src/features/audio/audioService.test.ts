@@ -1,10 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { AudioService } from './audioService'
 
-class FakeAudio {
+class FakeAudio extends EventTarget {
   static instances: FakeAudio[] = []
   static rejectPlayback = false
   static supportsOgg = true
+  static playbackEvents: string[] = []
 
   readonly dataset: Record<string, string> = {}
   readonly src: string
@@ -13,11 +14,19 @@ class FakeAudio {
   preload = ''
   volume = 1
   readonly pause = vi.fn()
-  readonly play = vi.fn(() => FakeAudio.rejectPlayback
-    ? Promise.reject(new Error('playback failed'))
-    : Promise.resolve())
+  readonly play = vi.fn(() => {
+    if (FakeAudio.rejectPlayback) return Promise.reject(new Error('playback failed'))
+    const event = this.dataset.soundEvent ?? 'probe'
+    FakeAudio.playbackEvents.push(`play:${event}`)
+    queueMicrotask(() => {
+      FakeAudio.playbackEvents.push(`ended:${event}`)
+      this.dispatchEvent(new Event('ended'))
+    })
+    return Promise.resolve()
+  })
 
   constructor(src = '') {
+    super()
     this.src = src
     FakeAudio.instances.push(this)
   }
@@ -28,13 +37,13 @@ class FakeAudio {
 }
 
 async function flushTransitions() {
-  await Promise.resolve()
-  await Promise.resolve()
+  for (let index = 0; index < 12; index += 1) await Promise.resolve()
 }
 
 beforeEach(() => {
   localStorage.clear()
   FakeAudio.instances = []
+  FakeAudio.playbackEvents = []
   FakeAudio.rejectPlayback = false
   FakeAudio.supportsOgg = true
   vi.stubGlobal('Audio', FakeAudio)
@@ -78,7 +87,7 @@ describe('AudioService', () => {
     expect(played.slice(-3).map((player) => player.src)).toEqual([
       '/audio/move.ogg',
       '/audio/move.ogg',
-      '/audio/capture.ogg',
+      '/audio/capture-chi.ogg',
     ])
     expect(played.slice(-3).map((player) => player.playbackRate)).toEqual([1, 1, 1])
   })
@@ -91,7 +100,7 @@ describe('AudioService', () => {
     service.emit('game-mp3', 1, 'capture')
     await flushTransitions()
 
-    expect(FakeAudio.instances.at(-1)?.src).toBe('/audio/capture.mp3')
+    expect(FakeAudio.instances.at(-1)?.src).toBe('/audio/capture-chi.mp3')
     expect(FakeAudio.instances.at(-1)?.playbackRate).toBe(1)
   })
 
@@ -121,7 +130,54 @@ describe('AudioService', () => {
     )
     expect(played).toHaveLength(1)
     expect(played[0].dataset.soundEvent).toBe('capture')
-    expect(played[0].src).toBe('/audio/capture.ogg')
+    expect(played[0].src).toBe('/audio/capture-chi.ogg')
+  })
+
+  it('deduplicates the same authoritative version independently for both players', async () => {
+    const redService = new AudioService()
+    const blackService = new AudioService()
+    await redService.unlock()
+    await blackService.unlock()
+
+    redService.emitLive('game-shared', 12, ['move-self'])
+    redService.emitLive('game-shared', 12, ['move-self'])
+    blackService.emitLive('game-shared', 12, ['move-opponent'])
+    blackService.emitLive('game-shared', 12, ['move-opponent'])
+    await flushTransitions()
+
+    const moves = FakeAudio.instances.filter(
+      (player) => player.volume > 0 && player.dataset.soundEvent?.startsWith('move-'),
+    )
+    expect(moves).toHaveLength(2)
+    expect(moves.map((player) => player.src)).toEqual([
+      '/audio/move.ogg',
+      '/audio/move.ogg',
+    ])
+  })
+
+  it('plays a terminal capture before the result and deduplicates both events', async () => {
+    const service = new AudioService()
+    await service.unlock()
+    FakeAudio.playbackEvents = []
+
+    service.emitLive('game-terminal-capture', 18, ['capture', 'game-win'])
+    service.emitLive('game-terminal-capture', 18, ['capture', 'game-win'])
+    await flushTransitions()
+
+    const played = FakeAudio.instances.filter(
+      (player) => player.volume > 0 && player.play.mock.calls.length > 0,
+    )
+    expect(played.map((player) => player.dataset.soundEvent)).toEqual([
+      'capture',
+      'game-win',
+    ])
+    expect(played[0].src).toBe('/audio/capture-chi.ogg')
+    expect(FakeAudio.playbackEvents).toEqual([
+      'play:capture',
+      'ended:capture',
+      'play:game-win',
+      'ended:game-win',
+    ])
   })
 
   it('clamps persisted volume and isolates playback failures', async () => {

@@ -161,6 +161,7 @@ public sealed class MatchmakingController(MatchmakingService matchmaking) : Cont
 [Route("api/games")]
 public sealed class GamesController(
     GameService games,
+    TakebackService takebacks,
     HistoryService history,
     MistChessMetrics metrics) : ControllerBase
 {
@@ -231,6 +232,39 @@ public sealed class GamesController(
     [ProducesResponseType<DrawOfferView>(StatusCodes.Status200OK)]
     public async Task<ActionResult<DrawOfferView>> RejectDraw(Guid gameId, CancellationToken cancellationToken) =>
         Ok(await games.RejectDrawAsync(gameId, CurrentPlayer.GetId(User), cancellationToken));
+
+    [HttpPost("{gameId:guid}/takeback-requests", Name = "createTakebackRequest")]
+    [ValidateAntiForgeryToken]
+    [EnableRateLimiting("command")]
+    [ProducesResponseType<TakebackRequestView>(StatusCodes.Status200OK)]
+    [ProducesResponseType<ErrorResponse>(StatusCodes.Status409Conflict)]
+    public async Task<ActionResult<TakebackRequestView>> CreateTakeback(
+        Guid gameId,
+        [FromBody] CreateTakebackRequest request,
+        CancellationToken cancellationToken) =>
+        Ok(await takebacks.CreateAsync(gameId, CurrentPlayer.GetId(User), request, cancellationToken));
+
+    [HttpPost("{gameId:guid}/takeback-requests/{requestId:guid}/accept", Name = "acceptTakebackRequest")]
+    [ValidateAntiForgeryToken]
+    [EnableRateLimiting("command")]
+    [ProducesResponseType<ApiGameView>(StatusCodes.Status200OK)]
+    [ProducesResponseType<ErrorResponse>(StatusCodes.Status409Conflict)]
+    public async Task<ActionResult<ApiGameView>> AcceptTakebackRequest(
+        Guid gameId,
+        Guid requestId,
+        CancellationToken cancellationToken) =>
+        Ok(await takebacks.AcceptAsync(gameId, requestId, CurrentPlayer.GetId(User), cancellationToken));
+
+    [HttpPost("{gameId:guid}/takeback-requests/{requestId:guid}/reject", Name = "rejectTakebackRequest")]
+    [ValidateAntiForgeryToken]
+    [EnableRateLimiting("command")]
+    [ProducesResponseType<TakebackRequestView>(StatusCodes.Status200OK)]
+    [ProducesResponseType<ErrorResponse>(StatusCodes.Status409Conflict)]
+    public async Task<ActionResult<TakebackRequestView>> RejectTakebackRequest(
+        Guid gameId,
+        Guid requestId,
+        CancellationToken cancellationToken) =>
+        Ok(await takebacks.RejectAsync(gameId, requestId, CurrentPlayer.GetId(User), cancellationToken));
 
     [HttpGet("{gameId:guid}/replay", Name = "getReplay")]
     [EnableRateLimiting("history-read")]

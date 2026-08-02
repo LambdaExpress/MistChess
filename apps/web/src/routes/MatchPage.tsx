@@ -52,6 +52,7 @@ export function MatchPage() {
   const ticket = ticketQuery.data
   useEffect(() => {
     if (ticket?.status === 'matched' && ticket.gameId) {
+      audioService.emit(ticket.gameId, 0, 'match-found')
       void navigate(`/game/${encodeURIComponent(ticket.gameId)}`, { replace: true })
     }
   }, [navigate, ticket?.gameId, ticket?.status])

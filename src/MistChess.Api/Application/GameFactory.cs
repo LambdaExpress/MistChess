@@ -203,6 +203,8 @@ public sealed class GameFactory(IGameStateSerializer stateSerializer, TimeProvid
                 ? null
                 : now.AddMilliseconds(initialExpiryMilliseconds.Value),
             Version = 0,
+            NegotiationVersion = 0,
+            TakebackWindowConsumed = false,
             CreatedAt = now,
             UpdatedAt = now
         };
@@ -666,6 +668,31 @@ public sealed class GameCompletionService(RatingService ratings, MistChessMetric
         if (created)
         {
             GameFactory.Finish(game, room, winner, reason, now);
+            var pendingDrawOffers = await db.DrawOffers
+                .Where(value => value.GameId == game.Id && value.Status == MistChess.Infrastructure.Persistence.DrawOfferStatus.Pending)
+                .ToListAsync(cancellationToken);
+            var pendingTakebacks = await db.TakebackRequests
+                .Where(value => value.GameId == game.Id && value.Status == MistChess.Infrastructure.Persistence.TakebackRequestStatus.Pending)
+                .ToListAsync(cancellationToken);
+            foreach (var offer in pendingDrawOffers)
+            {
+                if (offer.Status != MistChess.Infrastructure.Persistence.DrawOfferStatus.Pending)
+                {
+                    continue;
+                }
+
+                offer.Status = MistChess.Infrastructure.Persistence.DrawOfferStatus.Withdrawn;
+                offer.UpdatedAt = now;
+                game.NegotiationVersion++;
+            }
+
+            foreach (var request in pendingTakebacks)
+            {
+                request.Status = MistChess.Infrastructure.Persistence.TakebackRequestStatus.Withdrawn;
+                request.ResolvedAtVersion = game.Version;
+                request.UpdatedAt = now;
+                game.NegotiationVersion++;
+            }
         }
 
         await ratings.SettleAsync(db, game, now, cancellationToken);

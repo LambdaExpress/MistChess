@@ -1,8 +1,10 @@
+import { useEffect } from 'react'
 import { BrowserRouter, Outlet, Route, Routes } from 'react-router'
 import { AppShell } from './components/AppShell'
 import { SessionGate } from './features/session/SessionGate'
 import { AdminGate } from './features/admin/AdminGate'
 import { AdminLayout } from './features/admin/AdminLayout'
+import { audioService } from './features/audio/audioService'
 import { GamePage } from './routes/GamePage'
 import { HomePage } from './routes/HomePage'
 import { HistoryPage } from './routes/HistoryPage'
@@ -16,6 +18,16 @@ import { AdminUserDetailPage } from './routes/admin/AdminUserDetailPage'
 import { AdminUsersPage } from './routes/admin/AdminUsersPage'
 
 function App() {
+  useEffect(() => {
+    const unlock = () => void audioService.unlock()
+    window.addEventListener('pointerdown', unlock)
+    window.addEventListener('keydown', unlock)
+    return () => {
+      window.removeEventListener('pointerdown', unlock)
+      window.removeEventListener('keydown', unlock)
+    }
+  }, [])
+
   return (
     <BrowserRouter>
       <Routes>

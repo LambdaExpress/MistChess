@@ -15,15 +15,19 @@ import {
   type PieceType,
   type Position,
   type Side,
+  type TakebackRequestView,
 } from '../api/types'
 import { ErrorPanel, PageLoader } from '../components/AppShell'
 import { GameBoard } from '../components/board/GameBoard'
-import {
-  replaceWithAuthoritativeGameView,
-  replaceWithNewerGameView,
-} from '../features/game/gameViewCache'
 import { audioService, type SoundEvent } from '../features/audio/audioService'
+import { GameNegotiationOverlay } from '../features/game/GameNegotiationOverlay'
+import { PlayerClockBar } from '../features/game/PlayerClockBar'
 import { interpolateClock } from '../features/game/clock'
+import {
+  mergeDrawOfferChange,
+  mergeGameView,
+  mergeTakebackRequestChange,
+} from '../features/game/gameViewCache'
 
 const sideNames: Record<Side, string> = { red: '红方', black: '黑方' }
 const pieceNames: Record<Side, Record<PieceType, string>> = {
@@ -31,10 +35,10 @@ const pieceNames: Record<Side, Record<PieceType, string>> = {
   black: { general: '将', advisor: '士', elephant: '象', horse: '马', rook: '车', cannon: '炮', pawn: '卒' },
 }
 const realtimeLabels: Record<RealtimeState, string> = {
-  connecting: '实时连接中',
-  connected: '实时同步',
-  reconnecting: '正在恢复实时连接',
-  disconnected: '实时连接中断',
+  connecting: '正在连接实时棋局',
+  connected: '实时棋局已连接',
+  reconnecting: '正在恢复实时连接，操作已暂停',
+  disconnected: '实时连接已中断，操作已暂停',
 }
 const resultReasons: Record<GameResult['reason'], string> = {
   generalCaptured: '将帅被吃',
@@ -57,40 +61,43 @@ type ClockSnapshot = {
   playing: boolean
 }
 
-
 function useInterpolatedClock(view: GameView | undefined) {
+  const clock = view?.clock
+  const version = view?.version
+  const sideToMove = view?.sideToMove
+  const status = view?.status
   const snapshotRef = useRef<ClockSnapshot | null>(null)
   const [monotonicNow, setMonotonicNow] = useState(() => performance.now())
 
   useEffect(() => {
-    if (!view?.clock) {
+    if (!clock || version === undefined || !sideToMove || !status) {
       snapshotRef.current = null
       return
     }
 
     const receivedAt = performance.now()
     snapshotRef.current = {
-      version: view.version,
-      redMilliseconds: view.clock.redMilliseconds,
-      blackMilliseconds: view.clock.blackMilliseconds,
-      turnMilliseconds: view.clock.turnMilliseconds ?? null,
+      version,
+      redMilliseconds: clock.redMilliseconds,
+      blackMilliseconds: clock.blackMilliseconds,
+      turnMilliseconds: clock.turnMilliseconds ?? null,
       receivedAt,
-      sideToMove: view.sideToMove,
-      playing: view.status === 'playing',
+      sideToMove,
+      playing: status === 'playing',
     }
     setMonotonicNow(receivedAt)
-  }, [view])
+  }, [clock, sideToMove, status, version])
 
   useEffect(() => {
-    if (!view?.clock || view.status !== 'playing') return
+    if (!clock || status !== 'playing') return
     const timer = window.setInterval(() => setMonotonicNow(performance.now()), 200)
     return () => window.clearInterval(timer)
-  }, [view?.clock, view?.status])
+  }, [clock, status])
 
   const snapshot = snapshotRef.current
   if (!snapshot) {
-    return view?.clock
-      ? { ...view.clock, turnMilliseconds: view.clock.turnMilliseconds ?? null }
+    return clock
+      ? { ...clock, turnMilliseconds: clock.turnMilliseconds ?? null }
       : null
   }
   const remaining = interpolateClock(
@@ -103,58 +110,54 @@ function useInterpolatedClock(view: GameView | undefined) {
   const elapsedMilliseconds = monotonicNow - snapshot.receivedAt
   return {
     ...remaining,
-    serverTime: view?.clock?.serverTime ?? '',
+    serverTime: clock?.serverTime ?? '',
     turnMilliseconds: snapshot.turnMilliseconds === null || !snapshot.playing
       ? snapshot.turnMilliseconds
       : Math.max(0, snapshot.turnMilliseconds - elapsedMilliseconds),
   }
 }
 
-function formatClock(milliseconds: number): string {
-  const safeMilliseconds = Math.max(0, milliseconds)
-  if (safeMilliseconds < 10_000) {
-    return (safeMilliseconds / 1_000).toFixed(1)
-  }
+function terminalSound(view: GameView): SoundEvent | null {
+  if (view.status !== 'finished' || !view.result) return null
+  if (view.result.winner === null) return 'game-draw'
+  return view.result.winner === view.perspective ? 'game-win' : 'game-loss'
+}
 
-  const totalSeconds = Math.ceil(safeMilliseconds / 1_000)
-  const minutes = Math.floor(totalSeconds / 60).toString().padStart(2, '0')
-  const seconds = (totalSeconds % 60).toString().padStart(2, '0')
-  return `${minutes}:${seconds}`
+function liveSoundEvents(view: GameView): readonly SoundEvent[] {
+  const events: SoundEvent[] = []
+  const action = view.lastAction?.version === view.version ? view.lastAction : null
+  const terminal = terminalSound(view)
+
+  if (action?.kind === 'capture') events.push('capture')
+  if (terminal) {
+    events.push(terminal)
+  } else if (action?.kind === 'move') {
+    events.push(action.actor === view.perspective ? 'move-self' : 'move-opponent')
+  }
+  return events
 }
 
 export function GamePage() {
   const { gameId = '' } = useParams<{ gameId: string }>()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
-  const [drawOffer, setDrawOffer] = useState<DrawOffer | null>(null)
   const [opponentConnected, setOpponentConnected] = useState(true)
   const [confirmResign, setConfirmResign] = useState(false)
   const [commandError, setCommandError] = useState<string | null>(null)
+  const [negotiationError, setNegotiationError] = useState<string | null>(null)
   const commandLock = useRef(false)
   const [commandPending, setCommandPending] = useState(false)
-
-  const previousView = useRef<GameView | null>(null)
+  const audioBaselineVersion = useRef<number | null>(null)
   const lowThresholds = useRef(new Set<number>())
   const previousOwnRemaining = useRef<number | null>(null)
-  const runCommand = (command: () => void) => {
-    if (commandLock.current) return
-    commandLock.current = true
-    setCommandPending(true)
-    setCommandError(null)
-    command()
-  }
-
-  const releaseCommand = () => {
-    commandLock.current = false
-    setCommandPending(false)
-  }
 
   const gameQuery = useQuery({
     queryKey: queryKeys.game(gameId),
     queryFn: async () => {
       const incoming = await api.getGame(gameId)
+      audioBaselineVersion.current = Math.max(audioBaselineVersion.current ?? -1, incoming.version)
       const current = queryClient.getQueryData<GameView>(queryKeys.game(gameId))
-      return replaceWithAuthoritativeGameView(current, incoming)
+      return mergeGameView(current, incoming)
     },
     enabled: gameId.length > 0,
     retry: 1,
@@ -163,75 +166,85 @@ export function GamePage() {
   const { refetch: refetchGame } = gameQuery
   const interpolatedClock = useInterpolatedClock(view)
 
-  useEffect(() => {
-    setDrawOffer(view?.drawOffer ?? null)
-  }, [view?.drawOffer])
-
-  const storeView = (incoming: GameView) => {
+  const storeRecoveryView = (incoming: GameView) => {
+    audioBaselineVersion.current = Math.max(audioBaselineVersion.current ?? -1, incoming.version)
     queryClient.setQueryData<GameView>(queryKeys.game(gameId), (current) =>
-      replaceWithNewerGameView(current, incoming),
+      mergeGameView(current, incoming),
+    )
+  }
+
+  const storeLiveView = (incoming: GameView) => {
+    setNegotiationError(null)
+    const baseline = audioBaselineVersion.current
+    if (baseline === null || incoming.version > baseline) {
+      const events = liveSoundEvents(incoming)
+      if (events.length) audioService.emitLive(incoming.gameId, incoming.version, events)
+    }
+    audioBaselineVersion.current = Math.max(baseline ?? -1, incoming.version)
+    queryClient.setQueryData<GameView>(queryKeys.game(gameId), (current) =>
+      mergeGameView(current, incoming),
+    )
+  }
+
+  const storeDrawOffer = (offer: DrawOffer) => {
+    setNegotiationError(null)
+    queryClient.setQueryData<GameView>(queryKeys.game(gameId), (current) =>
+      mergeDrawOfferChange(current, offer),
+    )
+  }
+
+  const storeTakebackRequest = (request: TakebackRequestView) => {
+    setNegotiationError(null)
+    queryClient.setQueryData<GameView>(queryKeys.game(gameId), (current) =>
+      mergeTakebackRequestChange(current, request),
     )
   }
 
   const realtimeState = useGameHub({
     gameId,
     version: view?.version ?? 0,
-    onView: storeView,
-    onDrawOffer: setDrawOffer,
+    onView: storeLiveView,
+    onSnapshot: storeRecoveryView,
+    onDrawOffer: storeDrawOffer,
+    onTakebackRequest: storeTakebackRequest,
     onOpponentConnection: setOpponentConnected,
     onReconnect: () => {
       void refetchGame()
     },
   })
+  const interactionLocked = commandPending || realtimeState !== 'connected'
+
+  const runCommand = (command: () => void) => {
+    if (commandLock.current || realtimeState !== 'connected') return
+    commandLock.current = true
+    setCommandPending(true)
+    setCommandError(null)
+    command()
+  }
+
+  const runNegotiationCommand = (command: () => void) => {
+    setNegotiationError(null)
+    runCommand(command)
+  }
+
+  const releaseCommand = () => {
+    commandLock.current = false
+    setCommandPending(false)
+  }
+
+  const setNegotiationFailure = (error: unknown) => {
+    const message = errorMessage(error)
+    setNegotiationError(message)
+    setCommandError(message)
+  }
 
   useEffect(() => {
     const refreshAfterVisibilityChange = () => {
-      if (document.visibilityState === 'visible') {
-        void refetchGame()
-      }
+      if (document.visibilityState === 'visible') void refetchGame()
     }
     document.addEventListener('visibilitychange', refreshAfterVisibilityChange)
     return () => document.removeEventListener('visibilitychange', refreshAfterVisibilityChange)
   }, [refetchGame])
-
-  useEffect(() => {
-    if (!view) return
-    const previous = previousView.current
-    const startKey = `mistchess.audio.started.${view.gameId}`
-    const endKey = `mistchess.audio.ended.${view.gameId}.${view.version}`
-
-    if (!previous && view.status === 'playing' && !sessionStorage.getItem(startKey)) {
-      sessionStorage.setItem(startKey, '1')
-      audioService.emit(view.gameId, view.version, 'game-start')
-    }
-
-    if (view.status === 'finished' && view.result && !sessionStorage.getItem(endKey)) {
-      sessionStorage.setItem(endKey, '1')
-      const terminalEvent: SoundEvent = view.result.winner === null
-        ? 'game-draw'
-        : view.result.winner === view.perspective
-          ? 'game-win'
-          : 'game-loss'
-      audioService.emit(view.gameId, view.version, terminalEvent)
-    } else if (previous && view.version > previous.version) {
-      const captureCount = view.captureSummary.redLost.length +
-        view.captureSummary.blackLost.length
-      const previousCaptureCount = previous.captureSummary.redLost.length +
-        previous.captureSummary.blackLost.length
-      if (captureCount > previousCaptureCount) {
-        audioService.emit(view.gameId, view.version, 'capture')
-      } else if (view.sideToMove !== previous.sideToMove) {
-        const movingSide = view.sideToMove === 'red' ? 'black' : 'red'
-        audioService.emit(
-          view.gameId,
-          view.version,
-          movingSide === view.perspective ? 'move-self' : 'move-opponent',
-        )
-      }
-    }
-
-    previousView.current = view
-  }, [view])
 
   useEffect(() => {
     if (!view || !interpolatedClock || view.status !== 'playing') return
@@ -312,7 +325,7 @@ export function GamePage() {
         expectedVersion: version,
         clientMoveId: createClientId(),
       }),
-    onSuccess: storeView,
+    onSuccess: storeLiveView,
     onError: (error) => {
       if (error instanceof ApiError && error.code === 'STALE_VERSION') {
         setCommandError('棋局已更新，正在同步最新局面。')
@@ -329,7 +342,7 @@ export function GamePage() {
   const resign = useMutation({
     mutationFn: () => api.resignGame(gameId),
     onSuccess: (updatedView) => {
-      storeView(updatedView)
+      storeLiveView(updatedView)
       setConfirmResign(false)
     },
     onError: (error) => setCommandError(errorMessage(error)),
@@ -337,23 +350,41 @@ export function GamePage() {
   })
   const offerDraw = useMutation({
     mutationFn: () => api.offerDraw(gameId),
-    onSuccess: setDrawOffer,
-    onError: (error) => setCommandError(errorMessage(error)),
+    onSuccess: storeDrawOffer,
+    onError: setNegotiationFailure,
     onSettled: releaseCommand,
   })
   const acceptDraw = useMutation({
     mutationFn: () => api.acceptDraw(gameId),
-    onSuccess: (updatedView) => {
-      storeView(updatedView)
-      setDrawOffer(null)
-    },
-    onError: (error) => setCommandError(errorMessage(error)),
+    onSuccess: storeLiveView,
+    onError: setNegotiationFailure,
     onSettled: releaseCommand,
   })
   const rejectDraw = useMutation({
     mutationFn: () => api.rejectDraw(gameId),
-    onSuccess: () => setDrawOffer(null),
-    onError: (error) => setCommandError(errorMessage(error)),
+    onSuccess: storeDrawOffer,
+    onError: setNegotiationFailure,
+    onSettled: releaseCommand,
+  })
+  const requestTakeback = useMutation({
+    mutationFn: (expectedVersion: number) => api.createTakebackRequest(gameId, {
+      expectedVersion,
+      clientRequestId: createClientId(),
+    }),
+    onSuccess: storeTakebackRequest,
+    onError: setNegotiationFailure,
+    onSettled: releaseCommand,
+  })
+  const acceptTakeback = useMutation({
+    mutationFn: (requestId: string) => api.acceptTakebackRequest(gameId, requestId),
+    onSuccess: storeLiveView,
+    onError: setNegotiationFailure,
+    onSettled: releaseCommand,
+  })
+  const rejectTakeback = useMutation({
+    mutationFn: (requestId: string) => api.rejectTakebackRequest(gameId, requestId),
+    onSuccess: storeTakebackRequest,
+    onError: setNegotiationFailure,
     onSettled: releaseCommand,
   })
 
@@ -370,32 +401,36 @@ export function GamePage() {
   }
 
   const myTurn = view.status === 'playing' && view.sideToMove === view.perspective
-  const incomingDrawOffer = drawOffer?.status === 'pending' && drawOffer.offeredBy !== view.perspective
   const isFinished = view.status === 'finished'
   const captured = view.captureSummary
-  const redEffectiveMilliseconds = view.sideToMove === 'red' &&
-    interpolatedClock?.turnMilliseconds !== null &&
-    interpolatedClock?.turnMilliseconds !== undefined
-    ? Math.min(interpolatedClock.redMilliseconds, interpolatedClock.turnMilliseconds)
-    : interpolatedClock?.redMilliseconds
-  const blackEffectiveMilliseconds = view.sideToMove === 'black' &&
-    interpolatedClock?.turnMilliseconds !== null &&
-    interpolatedClock?.turnMilliseconds !== undefined
-    ? Math.min(interpolatedClock.blackMilliseconds, interpolatedClock.turnMilliseconds)
-    : interpolatedClock?.blackMilliseconds
+  const negotiationPending = Boolean(view.drawOffer || view.takebackRequest)
+  const opponentSide: Side = view.perspective === 'red' ? 'black' : 'red'
+  const totalForSide = (side: Side) => side === 'red'
+    ? interpolatedClock?.redMilliseconds ?? 0
+    : interpolatedClock?.blackMilliseconds ?? 0
+  const effectiveForSide = (side: Side) => {
+    const total = totalForSide(side)
+    return view.status === 'playing' && view.sideToMove === side && interpolatedClock?.turnMilliseconds != null
+      ? Math.min(total, interpolatedClock.turnMilliseconds)
+      : total
+  }
+  const clockBar = (side: Side, relationship: 'self' | 'opponent') => interpolatedClock ? (
+    <PlayerClockBar
+      side={side}
+      relationship={relationship}
+      totalMilliseconds={totalForSide(side)}
+      turnMilliseconds={view.sideToMove === side ? interpolatedClock.turnMilliseconds : null}
+      active={view.status === 'playing' && view.sideToMove === side}
+      low={effectiveForSide(side) < 10_000}
+    />
+  ) : null
 
   return (
     <div className="game-page">
-      <header className="game-header">
-        <div>
-          <p className="page-kicker">LIVE GAME · {view.ruleVersion}</p>
-          <h1>{isFinished ? '棋局结束' : myTurn ? '轮到你行棋' : `等待${sideNames[view.sideToMove]}行棋`}</h1>
-        </div>
-        <div className="game-connection" data-state={realtimeState}>
-          <span aria-hidden="true" />
-          <div><strong>{realtimeLabels[realtimeState]}</strong><small>局面版本 {view.version}</small></div>
-        </div>
+      <header className="game-header game-header--compact">
+        <h1>{isFinished ? '棋局结束' : myTurn ? '轮到你行棋' : `等待${sideNames[view.sideToMove]}行棋`}</h1>
       </header>
+      <p className="sr-only" role="status" aria-live="polite">{realtimeLabels[realtimeState]}</p>
 
       {!opponentConnected && !isFinished ? (
         <div className="notice-banner" role="status">对手暂时离线；棋局会在其使用原会话重连后继续。</div>
@@ -404,13 +439,42 @@ export function GamePage() {
 
       <div className="game-layout">
         <section className="board-column">
-          <GameBoard
-            view={view}
-            interactionLocked={commandPending}
-            onMove={(from, to) =>
-              runCommand(() => move.mutate({ from, to, version: view.version }))
-            }
-          />
+          {clockBar(opponentSide, 'opponent')}
+          {!interpolatedClock ? (
+            <section className="turn-card turn-card--board">
+              <span className={`side-token side-token--${view.sideToMove}`} aria-hidden="true">
+                {view.sideToMove === 'red' ? '帅' : '将'}
+              </span>
+              <div><small>当前行棋</small><strong>{sideNames[view.sideToMove]}</strong></div>
+              <span className={myTurn ? 'turn-badge turn-badge--mine' : 'turn-badge'}>{myTurn ? '你的回合' : '对方回合'}</span>
+            </section>
+          ) : null}
+          <div className="game-board-stage">
+            <GameBoard
+              view={view}
+              interactionLocked={interactionLocked}
+              onMove={(from, to) =>
+                runCommand(() => move.mutate({ from, to, version: view.version }))
+              }
+            />
+            <GameNegotiationOverlay
+              view={view}
+              submitting={commandPending}
+              locked={interactionLocked}
+              error={negotiationError}
+              onAcceptDraw={() => runNegotiationCommand(() => acceptDraw.mutate())}
+              onRejectDraw={() => runNegotiationCommand(() => rejectDraw.mutate())}
+              onAcceptTakeback={() => {
+                const requestId = view.takebackRequest?.id
+                if (requestId) runNegotiationCommand(() => acceptTakeback.mutate(requestId))
+              }}
+              onRejectTakeback={() => {
+                const requestId = view.takebackRequest?.id
+                if (requestId) runNegotiationCommand(() => rejectTakeback.mutate(requestId))
+              }}
+            />
+          </div>
+          {clockBar(view.perspective, 'self')}
           <div className="board-legend">
             <span><i className="legend-swatch legend-swatch--fog" />未知区域</span>
             <span><i className="legend-swatch legend-swatch--visible" />当前可见</span>
@@ -419,57 +483,6 @@ export function GamePage() {
         </section>
 
         <aside className="game-sidebar" aria-label="棋局状态与操作">
-          {interpolatedClock ? (
-            <section className="clock-card">
-              <div className={[
-                'clock-row',
-                view.sideToMove === 'black' ? 'clock-row--active' : '',
-                view.sideToMove === 'black' && (blackEffectiveMilliseconds ?? 0) < 10_000
-                  ? 'clock-row--low'
-                  : '',
-              ].filter(Boolean).join(' ')}>
-                <span className="side-token side-token--black">将</span>
-                <div>
-                  <small>黑方</small>
-                  <strong>{formatClock(interpolatedClock.blackMilliseconds)}</strong>
-                  {view.sideToMove === 'black' && interpolatedClock.turnMilliseconds !== null
-                    ? <span className="clock-turn">本步 {formatClock(interpolatedClock.turnMilliseconds)}</span>
-                    : null}
-                  {view.sideToMove === 'black' && (blackEffectiveMilliseconds ?? 0) < 10_000
-                    ? <em>时间不足</em>
-                    : null}
-                </div>
-              </div>
-              <div className={[
-                'clock-row',
-                view.sideToMove === 'red' ? 'clock-row--active' : '',
-                view.sideToMove === 'red' && (redEffectiveMilliseconds ?? 0) < 10_000
-                  ? 'clock-row--low'
-                  : '',
-              ].filter(Boolean).join(' ')}>
-                <span className="side-token side-token--red">帅</span>
-                <div>
-                  <small>红方</small>
-                  <strong>{formatClock(interpolatedClock.redMilliseconds)}</strong>
-                  {view.sideToMove === 'red' && interpolatedClock.turnMilliseconds !== null
-                    ? <span className="clock-turn">本步 {formatClock(interpolatedClock.turnMilliseconds)}</span>
-                    : null}
-                  {view.sideToMove === 'red' && (redEffectiveMilliseconds ?? 0) < 10_000
-                    ? <em>时间不足</em>
-                    : null}
-                </div>
-              </div>
-            </section>
-          ) : (
-            <section className="turn-card">
-              <span className={`side-token side-token--${view.sideToMove}`} aria-hidden="true">
-                {view.sideToMove === 'red' ? '帅' : '将'}
-              </span>
-              <div><small>当前行棋</small><strong>{sideNames[view.sideToMove]}</strong></div>
-              <span className={myTurn ? 'turn-badge turn-badge--mine' : 'turn-badge'}>{myTurn ? '你的回合' : '对方回合'}</span>
-            </section>
-          )}
-
           {isFinished && view.result ? (
             <section className="result-card" role="status">
               <p className="page-kicker">FINAL RESULT</p>
@@ -494,35 +507,41 @@ export function GamePage() {
           ) : (
             <section className="action-card">
               <h2>对局操作</h2>
-              {incomingDrawOffer ? (
-                <div className="draw-offer" role="alert">
-                  <strong>对手提议和棋</strong>
-                  <p>接受后棋局立即结束并记为和棋。</p>
-                  <div>
-                    <button type="button" className="button button--accent" disabled={commandPending} onClick={() => runCommand(() => acceptDraw.mutate())}>接受</button>
-                    <button type="button" className="button button--secondary" disabled={commandPending} onClick={() => runCommand(() => rejectDraw.mutate())}>拒绝</button>
-                  </div>
+              {!negotiationPending ? (
+                <div className="game-negotiation-actions" aria-label="协商操作">
+                  <button
+                    type="button"
+                    className="button button--secondary game-negotiation-actions__draw"
+                    disabled={interactionLocked}
+                    onClick={() => runNegotiationCommand(() => offerDraw.mutate())}
+                  >
+                    {offerDraw.isPending ? '正在发送…' : '提议和棋'}
+                  </button>
+                  {view.canRequestTakeback ? (
+                    <button
+                      type="button"
+                      className="button button--secondary game-negotiation-actions__takeback"
+                      disabled={interactionLocked}
+                      onClick={() => runNegotiationCommand(() => requestTakeback.mutate(view.version))}
+                    >
+                      {requestTakeback.isPending ? '正在发送…' : '请求悔棋'}
+                    </button>
+                  ) : null}
                 </div>
-              ) : drawOffer?.status === 'pending' ? (
-                <p className="muted-copy">已发出和棋提议，等待对手回应。</p>
-              ) : (
-                <button type="button" className="button button--secondary button--wide" disabled={commandPending} onClick={() => runCommand(() => offerDraw.mutate())}>
-                  {offerDraw.isPending ? '正在发送…' : '提议和棋'}
-                </button>
-              )}
+              ) : null}
 
               {confirmResign ? (
                 <div className="confirm-action" role="alertdialog" aria-label="确认认输">
                   <p>认输后不能撤销，确定结束本局？</p>
                   <div>
-                    <button type="button" className="button button--danger" disabled={commandPending} onClick={() => runCommand(() => resign.mutate())}>
+                    <button type="button" className="button button--danger" disabled={interactionLocked} onClick={() => runCommand(() => resign.mutate())}>
                       {resign.isPending ? '正在提交…' : '确认认输'}
                     </button>
                     <button type="button" className="button button--secondary" disabled={commandPending} onClick={() => setConfirmResign(false)}>继续对局</button>
                   </div>
                 </div>
               ) : (
-                <button type="button" className="text-danger" disabled={commandPending} onClick={() => setConfirmResign(true)}>认输</button>
+                <button type="button" className="text-danger" disabled={interactionLocked} onClick={() => setConfirmResign(true)}>认输</button>
               )}
             </section>
           )}

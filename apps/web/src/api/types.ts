@@ -13,9 +13,14 @@ export type MatchFound = {
   perspective: Side
 }
 export type GameView = components['schemas']['GameView']
+export type GameActionKind = components['schemas']['GameActionKind']
+export type GameActionView = components['schemas']['GameActionView']
+export type DrawOffer = components['schemas']['DrawOfferView']
+export type TakebackRequestStatus = components['schemas']['TakebackRequestStatus']
+export type TakebackRequestView = components['schemas']['TakebackRequestView']
+export type CreateTakebackRequest = components['schemas']['CreateTakebackRequest']
 export type PieceView = components['schemas']['PieceView']
 export type CandidateMove = components['schemas']['CandidateMoveView']
-export type DrawOffer = components['schemas']['DrawOfferView']
 export type HistoricalGame = components['schemas']['HistoricalGameSummaryView']
 export type HistoricalGamesPage = components['schemas']['HistoricalGamesPageView']
 export type HistoricalReplay = components['schemas']['HistoricalReplayView']

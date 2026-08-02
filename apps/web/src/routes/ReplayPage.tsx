@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useParams } from 'react-router'
 import { api, errorMessage } from '../api/client'
 import { queryKeys } from '../api/queryKeys'
@@ -9,13 +9,15 @@ import type {
   GameView,
   GuestSession,
   HistoricalReplay,
-  PieceType,
   Side,
 } from '../api/types'
 import { ErrorPanel, PageLoader } from '../components/AppShell'
 import { GameBoard } from '../components/board/GameBoard'
+import { ReplayStepControls } from '../components/board/ReplayStepControls'
+import { audioService } from '../features/audio/audioService'
+import type { SoundEvent } from '../features/audio/audioService'
 
-type ReplayMode = 'red' | 'black' | 'omniscient'
+type VisibilityMode = 'red' | 'black' | 'omniscient'
 
 const sideNames: Record<Side, string> = { red: '红方', black: '黑方' }
 const outcomeNames: Record<HistoricalReplay['red']['outcome'], string> = {
@@ -33,10 +35,6 @@ const reasonNames: Record<GameResult['reason'], string> = {
   noProgress: '无进展和棋',
   administrativeForfeit: '管理员判负',
 }
-const pieceNames: Record<Side, Record<PieceType, string>> = {
-  red: { general: '帅', advisor: '仕', elephant: '相', horse: '马', rook: '车', cannon: '炮', pawn: '兵' },
-  black: { general: '将', advisor: '士', elephant: '象', horse: '马', rook: '车', cannon: '炮', pawn: '卒' },
-}
 
 function useOpaqueTokenKey(token: string, enabled: boolean) {
   return useMemo(
@@ -45,12 +43,6 @@ function useOpaqueTokenKey(token: string, enabled: boolean) {
   )
 }
 
-function formatStaticClock(milliseconds: number) {
-  const seconds = Math.max(0, Math.ceil(milliseconds / 1_000))
-  return `${Math.floor(seconds / 60).toString().padStart(2, '0')}:${(seconds % 60)
-    .toString()
-    .padStart(2, '0')}`
-}
 
 export function ReplayPage({ shared = false }: { shared?: boolean }) {
   const { gameId = '', shareToken = '' } = useParams<{
@@ -61,10 +53,12 @@ export function ReplayPage({ shared = false }: { shared?: boolean }) {
   const session = queryClient.getQueryData<GuestSession>(queryKeys.session)
   const opaqueTokenKey = useOpaqueTokenKey(shareToken, shared)
   const [frameIndex, setFrameIndex] = useState(0)
-  const [mode, setMode] = useState<ReplayMode>('omniscient')
-  const [playing, setPlaying] = useState(false)
+  const [visibilityMode, setVisibilityMode] = useState<VisibilityMode>('omniscient')
+  const [orientation, setOrientation] = useState<Side>('red')
   const [sharePath, setSharePath] = useState('')
   const [copied, setCopied] = useState(false)
+  const replayAudioSession = useRef(createClientId()).current
+  const replayStepSequence = useRef(0)
   const replayKey = shared
     ? queryKeys.sharedReplay(opaqueTokenKey)
     : queryKeys.privateReplay(session?.playerId ?? '', gameId)
@@ -77,42 +71,16 @@ export function ReplayPage({ shared = false }: { shared?: boolean }) {
     staleTime: Number.POSITIVE_INFINITY,
   })
   const replay = replayQuery.data
+  const replayIdentity = replay?.gameId
+  const defaultSide = replay?.currentPlayerSide
 
   useEffect(() => {
-    if (!replay) return
+    if (!replayIdentity) return
     setFrameIndex(0)
-    setMode(replay.currentPlayerSide ?? 'omniscient')
-    setPlaying(false)
-  }, [replay])
-
-  useEffect(() => {
-    if (!playing || !replay) return
-    const timer = window.setInterval(() => {
-      setFrameIndex((current) => {
-        if (current >= replay.frames.length - 1) {
-          setPlaying(false)
-          return current
-        }
-        return current + 1
-      })
-    }, 900)
-    return () => window.clearInterval(timer)
-  }, [playing, replay])
-
-  useEffect(() => {
-    const handleKey = (event: KeyboardEvent) => {
-      if (!replay || event.target instanceof HTMLInputElement) return
-      if (event.key === 'ArrowLeft') {
-        event.preventDefault()
-        setFrameIndex((current) => Math.max(0, current - 1))
-      } else if (event.key === 'ArrowRight') {
-        event.preventDefault()
-        setFrameIndex((current) => Math.min(replay.frames.length - 1, current + 1))
-      }
-    }
-    window.addEventListener('keydown', handleKey)
-    return () => window.removeEventListener('keydown', handleKey)
-  }, [replay])
+    setVisibilityMode(defaultSide ?? 'omniscient')
+    setOrientation(defaultSide ?? 'red')
+    replayStepSequence.current = 0
+  }, [defaultSide, replayIdentity])
 
   const createShare = useMutation({
     mutationFn: () => api.createReplayShare(gameId),
@@ -145,8 +113,8 @@ export function ReplayPage({ shared = false }: { shared?: boolean }) {
 
   const safeIndex = Math.min(frameIndex, replay.frames.length - 1)
   const frame = replay.frames[safeIndex]
-  const projection = frame.views[mode]
-  const perspective: Side = mode === 'black' ? 'black' : 'red'
+  const projection = frame.views[visibilityMode]
+  const perspective: Side = visibilityMode === 'black' ? 'black' : 'red'
   const boardView: GameView = {
     gameId: replay.gameId,
     ruleVersion: replay.ruleVersion,
@@ -162,8 +130,11 @@ export function ReplayPage({ shared = false }: { shared?: boolean }) {
     captureSummary: projection.captureSummary,
     clock: frame.clock,
     drawOffer: null,
+    negotiationVersion: 0,
+    takebackRequest: null,
+    lastAction: null,
+    canRequestTakeback: false,
   }
-  const move = projection.move
   const shareUrl = sharePath ? new URL(sharePath, window.location.origin).toString() : ''
   const generateShare = () => {
     if (sharePath && !window.confirm('重新生成会立即使旧链接失效，是否继续？')) return
@@ -173,7 +144,30 @@ export function ReplayPage({ shared = false }: { shared?: boolean }) {
     await navigator.clipboard.writeText(shareUrl)
     setCopied(true)
   }
-
+  const previousFrame = () => setFrameIndex(Math.max(0, safeIndex - 1))
+  const nextFrame = () => {
+    if (safeIndex >= replay.frames.length - 1) return
+    const nextIndex = safeIndex + 1
+    const targetFrame = replay.frames[nextIndex]
+    const move = targetFrame.views.omniscient.move
+    const isTerminalFrame = nextIndex === replay.frames.length - 1
+    const events: SoundEvent[] = []
+    if (move?.captured) {
+      events.push('capture')
+    } else if (move && !isTerminalFrame) {
+      events.push('move-opponent')
+    }
+    if (isTerminalFrame) {
+      events.push(replay.result.winner === null
+        ? 'game-draw'
+        : replay.currentPlayerSide === null || replay.result.winner === replay.currentPlayerSide
+          ? 'game-win'
+          : 'game-loss')
+    }
+    setFrameIndex(nextIndex)
+    replayStepSequence.current += 1
+    audioService.emitReplay(`${replayAudioSession}:${replay.gameId}`, replayStepSequence.current, events)
+  }
   return (
     <div className="replay-page">
       <header className="replay-header">
@@ -207,7 +201,7 @@ export function ReplayPage({ shared = false }: { shared?: boolean }) {
         </p>
       </section>
 
-      <div className="replay-mode-switch" role="group" aria-label="回放视野">
+      <div className="replay-mode-switch" role="group" aria-label="信息视野">
         {([
           ['red', '红方视野'],
           ['black', '黑方视野'],
@@ -216,8 +210,24 @@ export function ReplayPage({ shared = false }: { shared?: boolean }) {
           <button
             type="button"
             key={value}
-            aria-pressed={mode === value}
-            onClick={() => setMode(value)}
+            aria-pressed={visibilityMode === value}
+            onClick={() => setVisibilityMode(value)}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      <div className="replay-mode-switch replay-orientation-switch" role="group" aria-label="棋盘朝向">
+        {([
+          ['red', '红方在下'],
+          ['black', '黑方在下'],
+        ] as const).map(([value, label]) => (
+          <button
+            type="button"
+            key={value}
+            aria-pressed={orientation === value}
+            onClick={() => setOrientation(value)}
           >
             {label}
           </button>
@@ -228,58 +238,29 @@ export function ReplayPage({ shared = false }: { shared?: boolean }) {
         <section className="board-column">
           <GameBoard
             view={boardView}
-            replayLabel={`${mode === 'omniscient' ? '全局' : sideNames[mode]}视野，第 ${frame.ply} 个半回合`}
+            orientation={orientation}
+            omniscientVisibility={visibilityMode === 'omniscient' ? {
+              red: frame.views.red.visibleSquares,
+              black: frame.views.black.visibleSquares,
+            } : undefined}
+            replayLabel={`${visibilityMode === 'omniscient' ? '全局' : sideNames[visibilityMode]}视野，${sideNames[orientation]}在下，第 ${frame.ply} 个半回合`}
           />
-        </section>
-
-        <aside className="replay-controls" aria-label="回放控制">
-          <div className="replay-counter">
-            <small>当前进度</small>
-            <strong>{safeIndex}<span> / {replay.frames.length - 1}</span></strong>
-          </div>
-          <div className="replay-move">
-            {move ? (
-              <>
-                <span className={`side-token side-token--${move.side}`} aria-hidden="true">
-                  {pieceNames[move.side][move.piece]}
-                </span>
-                <div>
-                  <strong>{sideNames[move.side]}{pieceNames[move.side][move.piece]}</strong>
-                  <p>{move.from.file + 1}路{move.from.rank + 1}线 → {move.to.file + 1}路{move.to.rank + 1}线</p>
-                  {move.captured ? <small>吃 {pieceNames[move.side === 'red' ? 'black' : 'red'][move.captured]}</small> : null}
-                </div>
-              </>
-            ) : (
-              <div>
-                <strong>{safeIndex === 0 ? '初始局面' : '对手走子或终局事件'}</strong>
-                <p>{mode === 'omniscient' ? '当前帧没有走子坐标' : '侧方视野不会显示对手原始走子坐标'}</p>
-              </div>
-            )}
-          </div>
-          {frame.clock ? (
-            <div className="replay-clock">
-              <span>红 {formatStaticClock(frame.clock.redMilliseconds)}</span>
-              <span>黑 {formatStaticClock(frame.clock.blackMilliseconds)}</span>
+          {visibilityMode === 'omniscient' ? (
+            <div className="board-legend replay-visibility-legend" aria-label="全局视野图例">
+              <span><i className="legend-swatch legend-swatch--red-blind" />红方盲区</span>
+              <span><i className="legend-swatch legend-swatch--black-blind" />黑方盲区</span>
+              <span><i className="legend-swatch legend-swatch--both-blind" />双方盲区</span>
+              <span><i className="legend-swatch legend-swatch--visible" />双方可见</span>
             </div>
           ) : null}
-          <input
-            type="range"
-            min="0"
-            max={replay.frames.length - 1}
-            value={safeIndex}
-            onChange={(event) => setFrameIndex(Number(event.target.value))}
-            aria-label="回放进度"
+          <ReplayStepControls
+            current={safeIndex}
+            total={replay.frames.length - 1}
+            onPrevious={previousFrame}
+            onNext={nextFrame}
+            className="replay-buttons"
           />
-          <div className="replay-buttons">
-            <button type="button" aria-label="回到开局" disabled={safeIndex === 0} onClick={() => setFrameIndex(0)}>«</button>
-            <button type="button" aria-label="上一步" disabled={safeIndex === 0} onClick={() => setFrameIndex(safeIndex - 1)}>‹</button>
-            <button type="button" aria-label={playing ? '暂停播放' : '开始播放'} onClick={() => setPlaying((value) => !value)}>
-              {playing ? 'Ⅱ' : '▶'}
-            </button>
-            <button type="button" aria-label="下一步" disabled={safeIndex === replay.frames.length - 1} onClick={() => setFrameIndex(safeIndex + 1)}>›</button>
-            <button type="button" aria-label="跳到终局" disabled={safeIndex === replay.frames.length - 1} onClick={() => setFrameIndex(replay.frames.length - 1)}>»</button>
-          </div>
-        </aside>
+        </section>
       </div>
 
       {!shared ? (

@@ -5,7 +5,7 @@ import {
   type HubConnection,
 } from '@microsoft/signalr'
 import { useEffect, useRef, useState } from 'react'
-import type { DrawOffer, GameView, MatchFound, MatchTicket } from './types'
+import type { DrawOffer, GameView, MatchFound, MatchTicket, TakebackRequestView } from './types'
 
 export type RealtimeState = 'connecting' | 'connected' | 'reconnecting' | 'disconnected'
 
@@ -34,7 +34,9 @@ interface GameHubHandlers {
   gameId: string
   version: number
   onView: (view: GameView) => void
+  onSnapshot?: (view: GameView) => void
   onDrawOffer: (offer: DrawOffer) => void
+  onTakebackRequest?: (request: TakebackRequestView) => void
   onOpponentConnection: (connected: boolean) => void
   onReconnect: () => void
 }
@@ -125,6 +127,9 @@ export function useGameHub(handlers: GameHubHandlers): RealtimeState {
     let disposed = false
     let retryTimer: number | undefined
 
+    connection.on('GameViewSnapshot', (view: GameView) => {
+      handlersRef.current.onSnapshot?.(view)
+    })
     connection.on('GameViewUpdated', (view: GameView) => {
       handlersRef.current.onView(view)
     })
@@ -133,6 +138,9 @@ export function useGameHub(handlers: GameHubHandlers): RealtimeState {
     })
     connection.on('DrawOfferChanged', (offer: DrawOffer) => {
       handlersRef.current.onDrawOffer(offer)
+    })
+    connection.on('TakebackRequestChanged', (request: TakebackRequestView) => {
+      handlersRef.current.onTakebackRequest?.(request)
     })
     connection.on(
       'OpponentConnectionChanged',

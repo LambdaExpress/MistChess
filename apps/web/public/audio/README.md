@@ -9,6 +9,12 @@ MistChess from two layered filtered-noise and low-frequency wood-impact
 transients. They contain the same 285 ms source sound, normalized to
 approximately -2 dBFS.
 
+`capture-chi.ogg` and `capture-chi.mp3` are encoded from the same original
+approximately 320 ms mono master. The spoken Mandarin word “吃” was generated
+locally with the Windows `Microsoft Huihui Desktop` text-to-speech voice, then
+mixed with the project's original `capture` wood-impact transient in FFmpeg.
+The final assets contain no recording copied from another game or third party.
+
 `mistchess-tone.ogg` and `mistchess-tone.mp3` remain the original procedural
 FFmpeg sine tone used by non-move interface events.
 

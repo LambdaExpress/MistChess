@@ -10,10 +10,10 @@ using MistChess.Api.Contracts;
 using MistChess.Domain;
 using MistChess.Infrastructure.Persistence;
 using Npgsql;
-using ApiDrawStatus = MistChess.Api.Contracts.DrawOfferStatus;
 using ApiGameView = MistChess.Api.Contracts.GameView;
 using ApiPosition = MistChess.Api.Contracts.Position;
 using DbDrawStatus = MistChess.Infrastructure.Persistence.DrawOfferStatus;
+using DbTakebackStatus = MistChess.Infrastructure.Persistence.TakebackRequestStatus;
 using DomainPosition = MistChess.Domain.Position;
 
 namespace MistChess.Api.Application;
@@ -40,10 +40,19 @@ public sealed class GameService(
         var drawOffer = await db.DrawOffers.AsNoTracking().SingleOrDefaultAsync(
             value => value.GameId == game.Id && value.Status == DbDrawStatus.Pending,
             cancellationToken);
+        var takebackRequest = await db.TakebackRequests.AsNoTracking().SingleOrDefaultAsync(
+            value => value.GameId == game.Id && value.Status == DbTakebackStatus.Pending,
+            cancellationToken);
+        var latestMove = await db.Moves.AsNoTracking()
+            .Where(value => value.GameId == game.Id && value.RevertedAt == null)
+            .OrderByDescending(value => value.Ply)
+            .FirstOrDefaultAsync(cancellationToken);
         return projector.Project(
             game,
             playerId,
-            drawOffer is null ? null : GameViewProjector.MapDrawOffer(game, drawOffer));
+            drawOffer is null ? null : GameViewProjector.MapDrawOffer(game, drawOffer),
+            takebackRequest is null ? null : GameViewProjector.MapTakebackRequest(game, takebackRequest),
+            latestMove);
     }
 
     public async Task<ApiGameView> MoveAsync(
@@ -81,12 +90,19 @@ public sealed class GameService(
                 cancellationToken);
         if (idempotent is not null)
         {
+            var projectionState = await LoadProjectionStateAsync(game, cancellationToken);
             await transaction.CommitAsync(cancellationToken);
             await notifier.GameUpdatedAsync(
                 game.Id,
                 game.Status == GameStatus.Finished,
                 applicationLifetime.ApplicationStopping);
-            return projector.ProjectHistoricalMove(game, idempotent, playerId);
+            return projector.ProjectHistoricalMove(
+                game,
+                idempotent,
+                playerId,
+                projectionState.DrawOffer,
+                projectionState.TakebackRequest,
+                projectionState.LatestMove);
         }
         var idempotentCommand = await db.MoveCommandReceipts
             .AsNoTracking()
@@ -97,12 +113,19 @@ public sealed class GameService(
                 cancellationToken);
         if (idempotentCommand is not null)
         {
+            var projectionState = await LoadProjectionStateAsync(game, cancellationToken);
             await transaction.CommitAsync(cancellationToken);
             await notifier.GameUpdatedAsync(
                 game.Id,
                 game.Status == GameStatus.Finished,
                 applicationLifetime.ApplicationStopping);
-            return projector.ProjectHistoricalCommand(game, idempotentCommand, playerId);
+            return projector.ProjectHistoricalCommand(
+                game,
+                idempotentCommand,
+                playerId,
+                projectionState.DrawOffer,
+                projectionState.TakebackRequest,
+                projectionState.LatestMove);
         }
 
 
@@ -122,6 +145,7 @@ public sealed class GameService(
             throw IllegalMove();
         }
 
+        var turnMillisecondsBefore = game.TurnMilliseconds;
         var now = ToDatabaseTimestamp(timeProvider.GetUtcNow());
         var (elapsed, timedOut) = await SettleElapsedClockAsync(game, now, cancellationToken);
         if (timedOut)
@@ -181,8 +205,14 @@ public sealed class GameService(
             UpdateClockExpiry(game, now);
             game.Version++;
         }
+        game.TakebackWindowConsumed = false;
+        game.LastActionVersion = game.Version;
+        game.LastActionKind = application.Event.CapturedPiece is null ? "move" : "capture";
+        game.LastActionActor = side;
 
-        var withdrawnOffer = await WithdrawPendingDrawOfferAsync(game.Id, now, cancellationToken);
+        var (withdrawnOffer, withdrawnTakeback) = game.Status == GameStatus.Playing
+            ? await WithdrawPendingNegotiationsAsync(game, now, cancellationToken)
+            : FindTerminalWithdrawals(game, now);
         var move = new MoveEntity
         {
             Id = Guid.NewGuid(),
@@ -196,6 +226,7 @@ public sealed class GameService(
             MovingPieceType = application.Event.MovingPiece.Type,
             CapturedPieceType = application.Event.CapturedPiece?.Type,
             ElapsedMilliseconds = elapsed,
+            TurnMillisecondsBefore = turnMillisecondsBefore,
             ClientMoveId = clientMoveId,
             PositionKey = newState.PositionKey,
             StateAfterJson = game.StateJson,
@@ -228,7 +259,14 @@ public sealed class GameService(
         {
             await notifier.DrawOfferChangedAsync(
                 game.Id,
-                ToDrawOfferView(game, withdrawnOffer),
+                GameViewProjector.MapDrawOffer(game, withdrawnOffer),
+                applicationLifetime.ApplicationStopping);
+        }
+        if (withdrawnTakeback is not null)
+        {
+            await notifier.TakebackRequestChangedAsync(
+                game.Id,
+                GameViewProjector.MapTakebackRequest(game, withdrawnTakeback),
                 applicationLifetime.ApplicationStopping);
         }
 
@@ -246,6 +284,33 @@ public sealed class GameService(
     }
 
     public async Task<ApiGameView> ResignAsync(Guid gameId, Guid playerId, CancellationToken cancellationToken)
+    {
+        const int maxAttempts = 3;
+        for (var attempt = 1; attempt <= maxAttempts; attempt++)
+        {
+            try
+            {
+                return await ResignCoreAsync(gameId, playerId, cancellationToken);
+            }
+            catch (Exception exception) when (attempt < maxAttempts && IsMoveCommitConflict(exception))
+            {
+                db.ChangeTracker.Clear();
+                logger.LogInformation(
+                    exception,
+                    "Retrying resignation concurrency conflict gameId={GameId} playerId={PlayerId} attempt={Attempt}",
+                    gameId,
+                    playerId,
+                    attempt);
+            }
+        }
+
+        throw new InvalidOperationException("The resignation retry loop completed without a result.");
+    }
+
+    private async Task<ApiGameView> ResignCoreAsync(
+        Guid gameId,
+        Guid playerId,
+        CancellationToken cancellationToken)
     {
         await using var transaction = await db.Database.BeginTransactionAsync(IsolationLevel.Serializable, cancellationToken);
         var game = await LoadGameForCommandAsync(gameId, playerId, cancellationToken);
@@ -273,6 +338,7 @@ public sealed class GameService(
             cancellationToken);
         await db.SaveChangesAsync(cancellationToken);
         await transaction.CommitAsync(cancellationToken);
+        await NotifyTerminalNegotiationChangesAsync(game);
         await notifier.GameUpdatedAsync(game.Id, true, applicationLifetime.ApplicationStopping);
         return projector.Project(game, playerId);
     }
@@ -293,6 +359,12 @@ public sealed class GameService(
         {
             throw ApiException.Conflict("GAME_FINISHED", "The game has already ended.", game.Id);
         }
+        if (await db.TakebackRequests.AnyAsync(
+            value => value.GameId == game.Id && value.Status == DbTakebackStatus.Pending,
+            cancellationToken))
+        {
+            throw ApiException.Conflict("NEGOTIATION_PENDING", "Another negotiation is already pending.", game.Id);
+        }
 
         var pending = await db.DrawOffers.SingleOrDefaultAsync(
             value => value.GameId == game.Id && value.Status == DbDrawStatus.Pending,
@@ -306,7 +378,7 @@ public sealed class GameService(
 
             await db.SaveChangesAsync(cancellationToken);
             await transaction.CommitAsync(cancellationToken);
-            var pendingView = ToDrawOfferView(game, pending);
+            var pendingView = GameViewProjector.MapDrawOffer(game, pending);
             await notifier.DrawOfferChangedAsync(
                 game.Id,
                 pendingView,
@@ -324,9 +396,10 @@ public sealed class GameService(
             UpdatedAt = now
         };
         db.DrawOffers.Add(offer);
+        game.NegotiationVersion++;
         await db.SaveChangesAsync(cancellationToken);
         await transaction.CommitAsync(cancellationToken);
-        var view = ToDrawOfferView(game, offer);
+        var view = GameViewProjector.MapDrawOffer(game, offer);
         await notifier.DrawOfferChangedAsync(game.Id, view, applicationLifetime.ApplicationStopping);
         return view;
     }
@@ -360,7 +433,7 @@ public sealed class GameService(
             await transaction.CommitAsync(cancellationToken);
             await notifier.DrawOfferChangedAsync(
                 game.Id,
-                ToDrawOfferView(game, offer),
+                GameViewProjector.MapDrawOffer(game, offer),
                 applicationLifetime.ApplicationStopping);
             await notifier.GameUpdatedAsync(game.Id, true, applicationLifetime.ApplicationStopping);
             return projector.Project(game, playerId);
@@ -377,6 +450,7 @@ public sealed class GameService(
 
         offer.Status = DbDrawStatus.Accepted;
         offer.UpdatedAt = now;
+        game.NegotiationVersion++;
         await FinishGameAsync(
             game,
             null,
@@ -387,7 +461,7 @@ public sealed class GameService(
         await transaction.CommitAsync(cancellationToken);
         await notifier.DrawOfferChangedAsync(
             game.Id,
-            ToDrawOfferView(game, offer),
+            GameViewProjector.MapDrawOffer(game, offer),
             applicationLifetime.ApplicationStopping);
         await notifier.GameUpdatedAsync(game.Id, true, applicationLifetime.ApplicationStopping);
         return projector.Project(game, playerId);
@@ -421,9 +495,10 @@ public sealed class GameService(
 
         offer.Status = DbDrawStatus.Rejected;
         offer.UpdatedAt = now;
+        game.NegotiationVersion++;
         await db.SaveChangesAsync(cancellationToken);
         await transaction.CommitAsync(cancellationToken);
-        var view = ToDrawOfferView(game, offer);
+        var view = GameViewProjector.MapDrawOffer(game, offer);
         await notifier.DrawOfferChangedAsync(game.Id, view, applicationLifetime.ApplicationStopping);
         return view;
     }
@@ -496,6 +571,16 @@ public sealed class GameService(
                     (value.RedPlayerId == playerId || value.BlackPlayerId == playerId),
                 recoveryToken)
             ?? throw ApiException.NotFound();
+        var currentDrawOffer = await recoveryDb.DrawOffers.AsNoTracking().SingleOrDefaultAsync(
+            value => value.GameId == currentGame.Id && value.Status == DbDrawStatus.Pending,
+            recoveryToken);
+        var currentTakeback = await recoveryDb.TakebackRequests.AsNoTracking().SingleOrDefaultAsync(
+            value => value.GameId == currentGame.Id && value.Status == DbTakebackStatus.Pending,
+            recoveryToken);
+        var latestMove = await recoveryDb.Moves.AsNoTracking()
+            .Where(value => value.GameId == currentGame.Id && value.RevertedAt == null)
+            .OrderByDescending(value => value.Ply)
+            .FirstOrDefaultAsync(recoveryToken);
         if (historical is null && historicalCommand is null)
         {
             throw ApiException.Conflict("STALE_VERSION", "The game version is stale.", currentGame.Id);
@@ -505,9 +590,11 @@ public sealed class GameService(
             currentGame.Id,
             currentGame.Status == GameStatus.Finished,
             recoveryToken);
+        var drawView = currentDrawOffer is null ? null : GameViewProjector.MapDrawOffer(currentGame, currentDrawOffer);
+        var takebackView = currentTakeback is null ? null : GameViewProjector.MapTakebackRequest(currentGame, currentTakeback);
         return historical is not null
-            ? projector.ProjectHistoricalMove(currentGame, historical, playerId)
-            : projector.ProjectHistoricalCommand(currentGame, historicalCommand!, playerId);
+            ? projector.ProjectHistoricalMove(currentGame, historical, playerId, drawView, takebackView, latestMove)
+            : projector.ProjectHistoricalCommand(currentGame, historicalCommand!, playerId, drawView, takebackView, latestMove);
     }
     private static MoveCommandReceiptEntity CreateMoveCommandReceipt(
         GameEntity game,
@@ -551,34 +638,68 @@ public sealed class GameService(
         return game;
     }
 
-    private async Task<DrawOfferEntity?> WithdrawPendingDrawOfferAsync(
-        Guid gameId,
+    private async Task<(DrawOfferEntity? DrawOffer, TakebackRequestEntity? TakebackRequest)> WithdrawPendingNegotiationsAsync(
+        GameEntity game,
         DateTimeOffset now,
         CancellationToken cancellationToken)
     {
         var offer = await db.DrawOffers.SingleOrDefaultAsync(
-            value => value.GameId == gameId && value.Status == DbDrawStatus.Pending,
+            value => value.GameId == game.Id && value.Status == DbDrawStatus.Pending,
             cancellationToken);
-        if (offer is null)
+        var takeback = await db.TakebackRequests.SingleOrDefaultAsync(
+            value => value.GameId == game.Id && value.Status == DbTakebackStatus.Pending,
+            cancellationToken);
+        if (offer is not null)
         {
-            return null;
+            offer.Status = DbDrawStatus.Withdrawn;
+            offer.UpdatedAt = now;
+            game.NegotiationVersion++;
         }
 
-        offer.Status = DbDrawStatus.Withdrawn;
-        offer.UpdatedAt = now;
-        return offer;
+        if (takeback is not null)
+        {
+            takeback.Status = DbTakebackStatus.Withdrawn;
+            takeback.ResolvedAtVersion = game.Version;
+            takeback.UpdatedAt = now;
+            game.NegotiationVersion++;
+        }
+
+        return (offer, takeback);
     }
 
-    private static DrawOfferView ToDrawOfferView(GameEntity game, DrawOfferEntity offer) => new(
-        offer.Status switch
-        {
-            DbDrawStatus.Pending => ApiDrawStatus.Pending,
-            DbDrawStatus.Accepted => ApiDrawStatus.Accepted,
-            DbDrawStatus.Rejected => ApiDrawStatus.Rejected,
-            DbDrawStatus.Withdrawn => ApiDrawStatus.Withdrawn,
-            _ => throw new ArgumentOutOfRangeException(nameof(offer))
-        },
-        GameFactory.GetSide(game, offer.OfferedByPlayerId));
+    private (DrawOfferEntity? DrawOffer, TakebackRequestEntity? TakebackRequest) FindTerminalWithdrawals(
+        GameEntity game,
+        DateTimeOffset now) =>
+        (
+            db.DrawOffers.Local.SingleOrDefault(value =>
+                value.GameId == game.Id &&
+                value.Status == DbDrawStatus.Withdrawn &&
+                value.UpdatedAt == now),
+            db.TakebackRequests.Local.SingleOrDefault(value =>
+                value.GameId == game.Id &&
+                value.Status == DbTakebackStatus.Withdrawn &&
+                value.ResolvedAtVersion == game.Version &&
+                value.UpdatedAt == now));
+
+    private async Task<(DrawOfferView? DrawOffer, TakebackRequestView? TakebackRequest, MoveEntity? LatestMove)> LoadProjectionStateAsync(
+        GameEntity game,
+        CancellationToken cancellationToken)
+    {
+        var offer = await db.DrawOffers.AsNoTracking().SingleOrDefaultAsync(
+            value => value.GameId == game.Id && value.Status == DbDrawStatus.Pending,
+            cancellationToken);
+        var takeback = await db.TakebackRequests.AsNoTracking().SingleOrDefaultAsync(
+            value => value.GameId == game.Id && value.Status == DbTakebackStatus.Pending,
+            cancellationToken);
+        var latestMove = await db.Moves.AsNoTracking()
+            .Where(value => value.GameId == game.Id && value.RevertedAt == null)
+            .OrderByDescending(value => value.Ply)
+            .FirstOrDefaultAsync(cancellationToken);
+        return (
+            offer is null ? null : GameViewProjector.MapDrawOffer(game, offer),
+            takeback is null ? null : GameViewProjector.MapTakebackRequest(game, takeback),
+            latestMove);
+    }
 
     private async Task<(long Elapsed, bool TimedOut)> SettleElapsedClockAsync(
         GameEntity game,
@@ -617,7 +738,31 @@ public sealed class GameService(
     {
         await db.SaveChangesAsync(cancellationToken);
         await transaction.CommitAsync(cancellationToken);
+        await NotifyTerminalNegotiationChangesAsync(game);
         await notifier.GameUpdatedAsync(game.Id, true, applicationLifetime.ApplicationStopping);
+    }
+
+    private async Task NotifyTerminalNegotiationChangesAsync(GameEntity game)
+    {
+        foreach (var offer in db.DrawOffers.Local.Where(value =>
+            value.GameId == game.Id && value.Status == DbDrawStatus.Withdrawn))
+        {
+            await notifier.DrawOfferChangedAsync(
+                game.Id,
+                GameViewProjector.MapDrawOffer(game, offer),
+                applicationLifetime.ApplicationStopping);
+        }
+
+        foreach (var request in db.TakebackRequests.Local.Where(value =>
+            value.GameId == game.Id &&
+            value.Status == DbTakebackStatus.Withdrawn &&
+            value.ResolvedAtVersion == game.Version))
+        {
+            await notifier.TakebackRequestChangedAsync(
+                game.Id,
+                GameViewProjector.MapTakebackRequest(game, request),
+                applicationLifetime.ApplicationStopping);
+        }
     }
 
     internal static long ApplyElapsedClock(GameEntity game, DateTimeOffset now)
@@ -669,7 +814,7 @@ public sealed class GameService(
         }
     }
 
-    private static void UpdateClockExpiry(GameEntity game, DateTimeOffset now)
+    internal static void UpdateClockExpiry(GameEntity game, DateTimeOffset now)
     {
         if (game.Status != GameStatus.Playing || game.TimeControl is null)
         {
@@ -690,7 +835,7 @@ public sealed class GameService(
 
     private static DomainPosition ToDomain(ApiPosition position) => new(position.File, position.Rank);
 
-    private static DateTimeOffset ToDatabaseTimestamp(DateTimeOffset value)
+    internal static DateTimeOffset ToDatabaseTimestamp(DateTimeOffset value)
     {
         var utc = value.ToUniversalTime();
         return new DateTimeOffset(
@@ -698,10 +843,506 @@ public sealed class GameService(
             TimeSpan.Zero);
     }
 
-    private static Side Opposite(Side side) => side == Side.Red ? Side.Black : Side.Red;
+    internal static Side Opposite(Side side) => side == Side.Red ? Side.Black : Side.Red;
 
     private static ApiException IllegalMove() =>
         ApiException.Unprocessable("ILLEGAL_MOVE", "The requested move is illegal.");
+}
+
+public sealed class TakebackService(
+    IDbContextFactory<MistChessDbContext> contextFactory,
+    IGameStateSerializer stateSerializer,
+    GameViewProjector projector,
+    GameCompletionService completion,
+    IGameNotifier notifier,
+    TimeProvider timeProvider,
+    IHostApplicationLifetime applicationLifetime,
+    ILogger<TakebackService> logger)
+{
+    private const int MaxAttempts = 3;
+
+    public Task<TakebackRequestView> CreateAsync(
+        Guid gameId,
+        Guid playerId,
+        CreateTakebackRequest command,
+        CancellationToken cancellationToken)
+    {
+        var clientRequestId = command.ClientRequestId.Trim();
+        if (clientRequestId.Length is < 1 or > 64)
+        {
+            throw ApiException.Unprocessable("TAKEBACK_NOT_AVAILABLE", "The takeback request is invalid.");
+        }
+
+        return ExecuteWithRetryAsync(
+            db => CreateCoreAsync(db, gameId, playerId, command.ExpectedVersion, clientRequestId, cancellationToken),
+            true,
+            gameId,
+            cancellationToken);
+    }
+
+    public Task<ApiGameView> AcceptAsync(
+        Guid gameId,
+        Guid requestId,
+        Guid playerId,
+        CancellationToken cancellationToken) =>
+        ExecuteWithRetryAsync(
+            db => AcceptCoreAsync(db, gameId, requestId, playerId, cancellationToken),
+            false,
+            gameId,
+            cancellationToken);
+
+    public Task<TakebackRequestView> RejectAsync(
+        Guid gameId,
+        Guid requestId,
+        Guid playerId,
+        CancellationToken cancellationToken) =>
+        ExecuteWithRetryAsync(
+            db => RejectCoreAsync(db, gameId, requestId, playerId, cancellationToken),
+            false,
+            gameId,
+            cancellationToken);
+
+    private async Task<TakebackRequestView> CreateCoreAsync(
+        MistChessDbContext db,
+        Guid gameId,
+        Guid playerId,
+        long expectedVersion,
+        string clientRequestId,
+        CancellationToken cancellationToken)
+    {
+        await using var transaction = await db.Database.BeginTransactionAsync(IsolationLevel.Serializable, cancellationToken);
+        var game = await LoadGameForCommandAsync(db, gameId, playerId, cancellationToken);
+        var idempotent = await db.TakebackRequests.SingleOrDefaultAsync(
+            value =>
+                value.GameId == game.Id &&
+                value.RequestedByPlayerId == playerId &&
+                value.ClientRequestId == clientRequestId,
+            cancellationToken);
+        if (idempotent is not null)
+        {
+            var idempotentView = GameViewProjector.MapTakebackRequest(game, idempotent);
+            await transaction.CommitAsync(cancellationToken);
+            return idempotentView;
+        }
+
+        var now = GameService.ToDatabaseTimestamp(timeProvider.GetUtcNow());
+        var timedOut = await SettleElapsedClockAsync(db, game, now, cancellationToken);
+        if (timedOut)
+        {
+            await db.SaveChangesAsync(cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+            await NotifyTerminalNegotiationChangesAsync(db, game);
+            await notifier.GameUpdatedAsync(game.Id, true, applicationLifetime.ApplicationStopping);
+            throw ApiException.Conflict("GAME_FINISHED", "The game has already ended.", game.Id);
+        }
+
+        if (game.Status != GameStatus.Playing)
+        {
+            throw ApiException.Conflict("GAME_FINISHED", "The game has already ended.", game.Id);
+        }
+
+        if (expectedVersion != game.Version)
+        {
+            throw ApiException.Conflict("STALE_VERSION", "The game version is stale.", game.Id);
+        }
+
+        if (await db.DrawOffers.AnyAsync(
+            value => value.GameId == game.Id && value.Status == DbDrawStatus.Pending,
+            cancellationToken))
+        {
+            throw ApiException.Conflict("NEGOTIATION_PENDING", "Another negotiation is already pending.", game.Id);
+        }
+
+        var requesterSide = GameFactory.GetSide(game, playerId);
+        var latestMove = await db.Moves
+            .Where(value => value.GameId == game.Id && value.RevertedAt == null)
+            .OrderByDescending(value => value.Ply)
+            .FirstOrDefaultAsync(cancellationToken);
+        if (latestMove is null ||
+            latestMove.Side != requesterSide ||
+            game.SideToMove == requesterSide ||
+            latestMove.GameVersion != game.Version)
+        {
+            throw ApiException.Conflict(
+                "TAKEBACK_NOT_AVAILABLE",
+                "Only the requester's latest move can be taken back while the opponent is to move.",
+                game.Id);
+        }
+
+        if (game.TakebackWindowConsumed || await db.TakebackRequests.AnyAsync(
+            value => value.MoveId == latestMove.Id,
+            cancellationToken))
+        {
+            throw ApiException.Conflict(
+                "TAKEBACK_ALREADY_REQUESTED",
+                "A takeback has already been requested for this move.",
+                game.Id);
+        }
+
+        if (await db.TakebackRequests.AnyAsync(
+            value => value.GameId == game.Id && value.Status == DbTakebackStatus.Pending,
+            cancellationToken))
+        {
+            throw ApiException.Conflict("NEGOTIATION_PENDING", "Another negotiation is already pending.", game.Id);
+        }
+
+        var request = new TakebackRequestEntity
+        {
+            Id = Guid.NewGuid(),
+            GameId = game.Id,
+            RequestedByPlayerId = playerId,
+            MoveId = latestMove.Id,
+            RequestedPly = latestMove.Ply,
+            RequestedAtVersion = game.Version,
+            ClientRequestId = clientRequestId,
+            Status = DbTakebackStatus.Pending,
+            CreatedAt = now,
+            UpdatedAt = now
+        };
+        db.TakebackRequests.Add(request);
+        game.TakebackWindowConsumed = true;
+        game.NegotiationVersion++;
+        await db.SaveChangesAsync(cancellationToken);
+        var view = GameViewProjector.MapTakebackRequest(game, request);
+        await transaction.CommitAsync(cancellationToken);
+        await notifier.TakebackRequestChangedAsync(game.Id, view, applicationLifetime.ApplicationStopping);
+        return view;
+    }
+
+    private async Task<ApiGameView> AcceptCoreAsync(
+        MistChessDbContext db,
+        Guid gameId,
+        Guid requestId,
+        Guid playerId,
+        CancellationToken cancellationToken)
+    {
+        await using var transaction = await db.Database.BeginTransactionAsync(IsolationLevel.Serializable, cancellationToken);
+        var game = await LoadGameForCommandAsync(db, gameId, playerId, cancellationToken);
+        var lockedRequests = await db.TakebackRequests
+            .FromSqlInterpolated(
+                $"SELECT * FROM takeback_requests WHERE id = {requestId} AND game_id = {game.Id} FOR UPDATE")
+            .ToListAsync(cancellationToken);
+        var request = lockedRequests.SingleOrDefault() ?? throw ApiException.NotFound();
+        if (request.RequestedByPlayerId == playerId)
+        {
+            throw ApiException.Conflict(
+                "CANNOT_RESPOND_OWN_REQUEST",
+                "The requesting player cannot respond to the takeback request.",
+                game.Id);
+        }
+
+        if (request.Status == DbTakebackStatus.Accepted)
+        {
+            var response = await ProjectCurrentAsync(db, game, playerId, cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+            await notifier.GameUpdatedAsync(
+                game.Id,
+                game.Status == GameStatus.Finished,
+                applicationLifetime.ApplicationStopping);
+            return response;
+        }
+
+        if (request.Status is DbTakebackStatus.Rejected or DbTakebackStatus.Withdrawn)
+        {
+            throw ApiException.Conflict(
+                "TAKEBACK_WINDOW_CLOSED",
+                "The takeback window has already closed.",
+                game.Id);
+        }
+
+        var lockedMoves = await db.Moves
+            .FromSqlInterpolated(
+                $"SELECT * FROM moves WHERE id = {request.MoveId} AND game_id = {game.Id} FOR UPDATE")
+            .ToListAsync(cancellationToken);
+        var targetMove = lockedMoves.SingleOrDefault();
+
+        var now = GameService.ToDatabaseTimestamp(timeProvider.GetUtcNow());
+        var timedOut = await SettleElapsedClockAsync(db, game, now, cancellationToken);
+        if (timedOut)
+        {
+            await db.SaveChangesAsync(cancellationToken);
+            var withdrawnView = GameViewProjector.MapTakebackRequest(game, request);
+            await transaction.CommitAsync(cancellationToken);
+            await notifier.TakebackRequestChangedAsync(game.Id, withdrawnView, applicationLifetime.ApplicationStopping);
+            await notifier.GameUpdatedAsync(game.Id, true, applicationLifetime.ApplicationStopping);
+            throw ApiException.Conflict(
+                "TAKEBACK_WINDOW_CLOSED",
+                "The takeback window closed when the game ended.",
+                game.Id);
+        }
+
+        if (game.Status != GameStatus.Playing || request.RequestedAtVersion != game.Version)
+        {
+            throw ApiException.Conflict(
+                "TAKEBACK_WINDOW_CLOSED",
+                "The takeback window has already closed.",
+                game.Id);
+        }
+
+        var latestMove = await db.Moves
+            .Where(value => value.GameId == game.Id && value.RevertedAt == null)
+            .OrderByDescending(value => value.Ply)
+            .FirstOrDefaultAsync(cancellationToken);
+        if (targetMove is null ||
+            latestMove?.Id != targetMove.Id ||
+            targetMove.RevertedAt is not null ||
+            targetMove.Ply != request.RequestedPly ||
+            GameFactory.GetSide(game, request.RequestedByPlayerId) != targetMove.Side ||
+            game.SideToMove == targetMove.Side)
+        {
+            throw ApiException.Conflict(
+                "TAKEBACK_WINDOW_CLOSED",
+                "The requested move is no longer the latest effective move.",
+                game.Id);
+        }
+
+        var previousMove = await db.Moves
+            .Where(value =>
+                value.GameId == game.Id &&
+                value.RevertedAt == null &&
+                value.Ply < targetMove.Ply)
+            .OrderByDescending(value => value.Ply)
+            .FirstOrDefaultAsync(cancellationToken);
+        var restoredStateJson = previousMove?.StateAfterJson ?? game.InitialStateJson;
+        var restoredState = stateSerializer.Deserialize(restoredStateJson);
+        if (restoredState.Status != GameStatus.Playing || restoredState.SideToMove != targetMove.Side)
+        {
+            throw new InvalidDataException("The persisted takeback snapshot is inconsistent with the requested move.");
+        }
+
+        RemoveOriginalIncrement(game, targetMove.Side);
+        game.StateJson = restoredStateJson;
+        game.SideToMove = restoredState.SideToMove;
+        game.Status = GameStatus.Playing;
+        game.Winner = null;
+        game.ResultReason = null;
+        game.FinishedAt = null;
+        game.TurnMilliseconds = game.MoveTimeLimitMilliseconds is null
+            ? null
+            : Math.Max(
+                0,
+                (targetMove.TurnMillisecondsBefore ?? game.MoveTimeLimitMilliseconds.Value) -
+                targetMove.ElapsedMilliseconds);
+        game.TurnStartedAt = game.TimeControl is null ? null : now;
+        game.UpdatedAt = now;
+        game.Version++;
+        game.LastActionVersion = game.Version;
+        game.LastActionKind = "takebackAccepted";
+        game.LastActionActor = targetMove.Side;
+        game.NegotiationVersion++;
+        targetMove.RevertedAt = now;
+        targetMove.RevertedByTakebackRequestId = request.Id;
+        request.Status = DbTakebackStatus.Accepted;
+        request.ResolvedAtVersion = game.Version;
+        request.UpdatedAt = now;
+        GameService.UpdateClockExpiry(game, now);
+        await db.SaveChangesAsync(cancellationToken);
+        var requestView = GameViewProjector.MapTakebackRequest(game, request);
+        var responseView = await ProjectCurrentAsync(db, game, playerId, cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+        await notifier.TakebackRequestChangedAsync(game.Id, requestView, applicationLifetime.ApplicationStopping);
+        await notifier.GameUpdatedAsync(game.Id, false, applicationLifetime.ApplicationStopping);
+        return responseView;
+    }
+
+    private async Task<TakebackRequestView> RejectCoreAsync(
+        MistChessDbContext db,
+        Guid gameId,
+        Guid requestId,
+        Guid playerId,
+        CancellationToken cancellationToken)
+    {
+        await using var transaction = await db.Database.BeginTransactionAsync(IsolationLevel.Serializable, cancellationToken);
+        var game = await LoadGameForCommandAsync(db, gameId, playerId, cancellationToken);
+        var lockedRequests = await db.TakebackRequests
+            .FromSqlInterpolated(
+                $"SELECT * FROM takeback_requests WHERE id = {requestId} AND game_id = {game.Id} FOR UPDATE")
+            .ToListAsync(cancellationToken);
+        var request = lockedRequests.SingleOrDefault() ?? throw ApiException.NotFound();
+        if (request.RequestedByPlayerId == playerId)
+        {
+            throw ApiException.Conflict(
+                "CANNOT_RESPOND_OWN_REQUEST",
+                "The requesting player cannot respond to the takeback request.",
+                game.Id);
+        }
+
+        if (request.Status != DbTakebackStatus.Pending)
+        {
+            var finalView = GameViewProjector.MapTakebackRequest(game, request);
+            await transaction.CommitAsync(cancellationToken);
+            return finalView;
+        }
+
+        var now = GameService.ToDatabaseTimestamp(timeProvider.GetUtcNow());
+        var timedOut = await SettleElapsedClockAsync(db, game, now, cancellationToken);
+        if (!timedOut)
+        {
+            if (game.Status != GameStatus.Playing)
+            {
+                throw ApiException.Conflict("GAME_FINISHED", "The game has already ended.", game.Id);
+            }
+
+            request.Status = DbTakebackStatus.Rejected;
+            request.ResolvedAtVersion = game.Version;
+            request.UpdatedAt = now;
+            game.NegotiationVersion++;
+        }
+
+        await db.SaveChangesAsync(cancellationToken);
+        var view = GameViewProjector.MapTakebackRequest(game, request);
+        await transaction.CommitAsync(cancellationToken);
+        await notifier.TakebackRequestChangedAsync(game.Id, view, applicationLifetime.ApplicationStopping);
+        if (timedOut)
+        {
+            await notifier.GameUpdatedAsync(game.Id, true, applicationLifetime.ApplicationStopping);
+        }
+
+        return view;
+    }
+
+    private async Task<bool> SettleElapsedClockAsync(
+        MistChessDbContext db,
+        GameEntity game,
+        DateTimeOffset now,
+        CancellationToken cancellationToken)
+    {
+        if (game.Status != GameStatus.Playing ||
+            game.TimeControl is null ||
+            game.TurnStartedAt is null)
+        {
+            return false;
+        }
+
+        GameService.ApplyElapsedClock(game, now);
+        var timedOutSide = game.SideToMove;
+        if (!GameService.HasTimedOut(game, timedOutSide))
+        {
+            game.TurnStartedAt = now;
+            GameService.UpdateClockExpiry(game, now);
+            return false;
+        }
+
+        var room = await db.Rooms.SingleOrDefaultAsync(value => value.GameId == game.Id, cancellationToken);
+        await completion.CompleteAsync(
+            db,
+            game,
+            room,
+            GameService.Opposite(timedOutSide),
+            GameResultReason.Timeout.ToString(),
+            now,
+            cancellationToken);
+        return true;
+    }
+
+    private async Task NotifyTerminalNegotiationChangesAsync(MistChessDbContext db, GameEntity game)
+    {
+        foreach (var offer in db.DrawOffers.Local.Where(value =>
+            value.GameId == game.Id && value.Status == DbDrawStatus.Withdrawn))
+        {
+            await notifier.DrawOfferChangedAsync(
+                game.Id,
+                GameViewProjector.MapDrawOffer(game, offer),
+                applicationLifetime.ApplicationStopping);
+        }
+
+        foreach (var request in db.TakebackRequests.Local.Where(value =>
+            value.GameId == game.Id &&
+            value.Status == DbTakebackStatus.Withdrawn &&
+            value.ResolvedAtVersion == game.Version))
+        {
+            await notifier.TakebackRequestChangedAsync(
+                game.Id,
+                GameViewProjector.MapTakebackRequest(game, request),
+                applicationLifetime.ApplicationStopping);
+        }
+    }
+
+    private async Task<ApiGameView> ProjectCurrentAsync(
+        MistChessDbContext db,
+        GameEntity game,
+        Guid playerId,
+        CancellationToken cancellationToken)
+    {
+        var drawOffer = await db.DrawOffers.AsNoTracking().SingleOrDefaultAsync(
+            value => value.GameId == game.Id && value.Status == DbDrawStatus.Pending,
+            cancellationToken);
+        var takeback = await db.TakebackRequests.AsNoTracking().SingleOrDefaultAsync(
+            value => value.GameId == game.Id && value.Status == DbTakebackStatus.Pending,
+            cancellationToken);
+        var latestMove = await db.Moves.AsNoTracking()
+            .Where(value => value.GameId == game.Id && value.RevertedAt == null)
+            .OrderByDescending(value => value.Ply)
+            .FirstOrDefaultAsync(cancellationToken);
+        return projector.Project(
+            game,
+            playerId,
+            drawOffer is null ? null : GameViewProjector.MapDrawOffer(game, drawOffer),
+            takeback is null ? null : GameViewProjector.MapTakebackRequest(game, takeback),
+            latestMove);
+    }
+
+    private static async Task<GameEntity> LoadGameForCommandAsync(
+        MistChessDbContext db,
+        Guid gameId,
+        Guid playerId,
+        CancellationToken cancellationToken)
+    {
+        var lockedGames = await db.Games
+            .FromSqlInterpolated(
+                $"SELECT * FROM games WHERE id = {gameId} AND (red_player_id = {playerId} OR black_player_id = {playerId}) FOR UPDATE")
+            .ToListAsync(cancellationToken);
+        var game = lockedGames.SingleOrDefault() ?? throw ApiException.NotFound();
+        await db.Entry(game).Collection(value => value.Players).LoadAsync(cancellationToken);
+        return game;
+    }
+
+    private static void RemoveOriginalIncrement(GameEntity game, Side requesterSide)
+    {
+        var increment = TimeControlSettings.Parse(game.TimeControl)?.IncrementMilliseconds ?? 0;
+        if (requesterSide == Side.Red && game.RedMilliseconds is { } red)
+        {
+            game.RedMilliseconds = Math.Max(0, red - increment);
+        }
+        else if (requesterSide == Side.Black && game.BlackMilliseconds is { } black)
+        {
+            game.BlackMilliseconds = Math.Max(0, black - increment);
+        }
+    }
+
+    private async Task<T> ExecuteWithRetryAsync<T>(
+        Func<MistChessDbContext, Task<T>> operation,
+        bool retryUniqueViolation,
+        Guid gameId,
+        CancellationToken cancellationToken)
+    {
+        for (var attempt = 1; attempt <= MaxAttempts; attempt++)
+        {
+            await using var commandDb = await contextFactory.CreateDbContextAsync(cancellationToken);
+            try
+            {
+                return await operation(commandDb);
+            }
+            catch (Exception exception) when (
+                attempt < MaxAttempts &&
+                IsRetryableConcurrencyFailure(exception, retryUniqueViolation))
+            {
+                logger.LogInformation(
+                    exception,
+                    "Retrying takeback concurrency conflict gameId={GameId} attempt={Attempt}",
+                    gameId,
+                    attempt);
+            }
+        }
+
+        throw new InvalidOperationException("The takeback retry loop completed without a result.");
+    }
+
+    private static bool IsRetryableConcurrencyFailure(Exception exception, bool retryUniqueViolation) =>
+        exception is DbUpdateConcurrencyException ||
+        exception.GetBaseException() is PostgresException postgres &&
+        (postgres.SqlState is "40001" or "40P01" ||
+         (retryUniqueViolation && postgres.SqlState == "23505"));
 }
 
 public sealed class GameClockWorker(
@@ -787,6 +1428,28 @@ public sealed class GameClockWorker(
         await transaction.CommitAsync(cancellationToken);
         foreach (var game in games)
         {
+            foreach (var offer in db.DrawOffers.Local.Where(value =>
+                value.GameId == game.Id &&
+                value.Status == DbDrawStatus.Withdrawn &&
+                value.UpdatedAt == now))
+            {
+                await notifier.DrawOfferChangedAsync(
+                    game.Id,
+                    GameViewProjector.MapDrawOffer(game, offer),
+                    cancellationToken);
+            }
+
+            foreach (var request in db.TakebackRequests.Local.Where(value =>
+                value.GameId == game.Id &&
+                value.Status == DbTakebackStatus.Withdrawn &&
+                value.ResolvedAtVersion == game.Version))
+            {
+                await notifier.TakebackRequestChangedAsync(
+                    game.Id,
+                    GameViewProjector.MapTakebackRequest(game, request),
+                    cancellationToken);
+            }
+
             await notifier.GameUpdatedAsync(game.Id, true, cancellationToken);
             var delayMilliseconds = Math.Max(
                 0,
@@ -893,7 +1556,7 @@ public sealed class HistoryService(
                 game.BlackPlayer.DisplayName,
                 game.Winner,
                 game.ResultReason!,
-                game.Moves.Count))
+                game.Moves.Count(move => move.RevertedAt == null)))
             .Take(limit + 1)
             .ToListAsync(cancellationToken);
         var hasMore = rows.Count > limit;
@@ -1103,11 +1766,11 @@ public sealed class HistoryService(
         .AsNoTracking()
         .Include(value => value.RedPlayer)
         .Include(value => value.BlackPlayer)
-        .Include(value => value.Moves.OrderBy(move => move.Ply));
+        .Include(value => value.Moves.Where(move => move.RevertedAt == null).OrderBy(move => move.Ply));
 
     private HistoricalReplayView BuildReplay(GameEntity game, Side? currentPlayerSide)
     {
-        var orderedMoves = game.Moves.OrderBy(value => value.Ply).ToArray();
+        var orderedMoves = game.Moves.Where(value => value.RevertedAt == null).OrderBy(value => value.Ply).ToArray();
         var frames = new List<HistoricalReplayFrameView>(orderedMoves.Length + 2);
         var initial = stateSerializer.Deserialize(game.InitialStateJson);
         var settings = TimeControlSettings.Parse(game.TimeControl);
@@ -1255,7 +1918,7 @@ public sealed class HistoryService(
     private static string CreateETag(GameEntity game, Side? side)
     {
         var input = Encoding.UTF8.GetBytes(
-            $"{game.Id:N}:{game.Version}:{game.Moves.Count}:{side?.ToString() ?? "shared"}");
+            $"{game.Id:N}:{game.Version}:{game.Moves.Count(value => value.RevertedAt == null)}:{side?.ToString() ?? "shared"}");
         return $"\"{Convert.ToHexString(SHA256.HashData(input)).ToLowerInvariant()}\"";
     }
 

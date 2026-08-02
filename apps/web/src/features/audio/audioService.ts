@@ -37,12 +37,12 @@ const EVENT_PRIORITY: Record<SoundEvent, number> = {
   'game-loss': 3,
   'game-draw': 3,
 }
-const SOUND_ASSET: Record<SoundEvent, 'mistchess-tone' | 'move' | 'capture'> = {
+const SOUND_ASSET: Record<SoundEvent, 'mistchess-tone' | 'move' | 'capture-chi'> = {
   'match-found': 'mistchess-tone',
   'game-start': 'mistchess-tone',
   'move-self': 'move',
   'move-opponent': 'move',
-  capture: 'capture',
+  capture: 'capture-chi',
   'clock-low': 'mistchess-tone',
   'game-win': 'mistchess-tone',
   'game-loss': 'mistchess-tone',
@@ -65,6 +65,8 @@ export class AudioService {
   private readonly listeners = new Set<() => void>()
   private readonly playedKeys = new Set<string>()
   private readonly pendingTransitions = new Map<string, QueuedSound>()
+  private readonly queuedKeys = new Set<string>()
+  private playbackQueue: Promise<void> = Promise.resolve()
   private queuedImportant: QueuedSound | null = null
   private unlocked = false
   private extension: 'ogg' | 'mp3' | null = null
@@ -99,7 +101,7 @@ export class AudioService {
       this.unlocked = true
       const queued = this.queuedImportant
       this.queuedImportant = null
-      if (queued) this.play(queued)
+      if (queued) void this.playAndWait(queued)
     } catch {
       this.diagnosticFailures += 1
     }
@@ -108,7 +110,7 @@ export class AudioService {
   emit(gameId: string, version: number, event: SoundEvent, discriminator = '') {
     const transitionKey = `${gameId}:${version}`
     const key = `${transitionKey}:${event}:${discriminator}`
-    if (this.playedKeys.has(key)) return
+    if (this.playedKeys.has(key) || this.queuedKeys.has(key)) return
 
     const queued = { key, event }
     const existing = this.pendingTransitions.get(transitionKey)
@@ -119,14 +121,46 @@ export class AudioService {
       const pending = this.pendingTransitions.get(transitionKey)
       if (!pending) return
       this.pendingTransitions.delete(transitionKey)
-      this.play(pending)
+      if (this.queuedKeys.has(pending.key)) return
+      void this.playAndWait(pending)
     })
+  }
+
+  emitLive(gameId: string, version: number, events: readonly SoundEvent[]) {
+    this.emitSequence(
+      events.map((event) => ({ key: `${gameId}:${version}:${event}:`, event })),
+    )
+  }
+
+  emitReplay(sessionId: string, stepSequence: number, events: readonly SoundEvent[]) {
+    this.emitSequence(
+      events.map((event) => ({
+        key: `replay:${sessionId}:${stepSequence}:${event}`,
+        event,
+      })),
+    )
   }
 
   getFailureCount() {
     return this.diagnosticFailures
   }
-  private play(sound: QueuedSound) {
+  private emitSequence(sounds: readonly QueuedSound[]) {
+    const queued = sounds.filter((sound) => {
+      if (this.playedKeys.has(sound.key) || this.queuedKeys.has(sound.key)) return false
+      this.queuedKeys.add(sound.key)
+      return true
+    })
+    if (!queued.length) return
+
+    this.playbackQueue = this.playbackQueue.then(async () => {
+      for (const sound of queued) {
+        this.queuedKeys.delete(sound.key)
+        await this.playAndWait(sound)
+      }
+    })
+  }
+
+  private async playAndWait(sound: QueuedSound): Promise<void> {
     if (this.playedKeys.has(sound.key)) return
     if (!this.settings.enabled || this.settings.volume === 0) {
       this.rememberPlayed(sound.key)
@@ -160,8 +194,27 @@ export class AudioService {
     const player = this.createPlayer(sound.event)
     player.volume = this.settings.volume
     player.playbackRate = PLAYBACK_RATE[sound.event]
-    void player.play().catch(() => {
-      this.diagnosticFailures += 1
+    if (typeof player.addEventListener !== 'function') {
+      try {
+        await player.play()
+      } catch {
+        this.diagnosticFailures += 1
+      }
+      return
+    }
+    await new Promise<void>((resolve) => {
+      let settled = false
+      const finish = () => {
+        if (settled) return
+        settled = true
+        resolve()
+      }
+      player.addEventListener('ended', finish, { once: true })
+      player.addEventListener('error', finish, { once: true })
+      void player.play().catch(() => {
+        this.diagnosticFailures += 1
+        finish()
+      })
     })
   }
 

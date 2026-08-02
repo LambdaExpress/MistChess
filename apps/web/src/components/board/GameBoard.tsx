@@ -7,6 +7,8 @@ interface GameBoardProps {
   interactionLocked?: boolean
   onMove?: (from: Position, to: Position) => void
   replayLabel?: string
+  orientation?: Side
+  omniscientVisibility?: { red: Position[]; black: Position[] }
 }
 
 interface InteractiveSquare {
@@ -44,8 +46,8 @@ const allPositions = Array.from({ length: 90 }, (_, index) => ({
   rank: Math.floor(index / 9),
 }))
 
-function boardPoint(position: Position, perspective: Side) {
-  const display = toDisplayPosition(position, perspective)
+function boardPoint(position: Position, orientation: Side) {
+  const display = toDisplayPosition(position, orientation)
   return {
     x: 71.5 + display.file * 55,
     y: 44 + (9 - display.rank) * 55,
@@ -53,14 +55,15 @@ function boardPoint(position: Position, perspective: Side) {
   }
 }
 
-function squareLabel(position: Position): string {
-  return `${position.file + 1}路、${position.rank + 1}线`
+function squareLabel(position: Position, orientation: Side): string {
+  const display = toDisplayPosition(position, orientation)
+  return `${display.file + 1}路、${display.rank + 1}线`
 }
 
-function PieceShape({ piece, perspective }: { piece: PieceView; perspective: Side }) {
-  const point = boardPoint(piece.position, perspective)
+function PieceShape({ piece, orientation }: { piece: PieceView; orientation: Side }) {
+  const point = boardPoint(piece.position, orientation)
   const name = pieceNames[piece.side][piece.type]
-  const ariaLabel = `${sideNames[piece.side]}${name}，位于${squareLabel(piece.position)}`
+  const ariaLabel = `${sideNames[piece.side]}${name}，位于${squareLabel(piece.position, orientation)}`
 
   return (
     <g
@@ -98,11 +101,13 @@ export function GameBoard({
   interactionLocked = false,
   onMove,
   replayLabel,
+  orientation = view.perspective,
+  omniscientVisibility,
 }: GameBoardProps) {
   const [selected, setSelected] = useState<Position | null>(null)
   const isPlayerTurn =
     view.status === 'playing' && view.sideToMove === view.perspective
-
+  const isPlayableTurn = isPlayerTurn && !interactionLocked
   useEffect(() => {
     setSelected(null)
   }, [view.version])
@@ -111,6 +116,10 @@ export function GameBoard({
     () => new Set(view.visibleSquares.map(positionKey)),
     [view.visibleSquares],
   )
+  const omniscientVisibleKeys = useMemo(() => omniscientVisibility ? {
+    red: new Set(omniscientVisibility.red.map(positionKey)),
+    black: new Set(omniscientVisibility.black.map(positionKey)),
+  } : null, [omniscientVisibility])
   const piecesByPosition = useMemo(
     () => new Map(view.pieces.map((piece) => [positionKey(piece.position), piece])),
     [view.pieces],
@@ -131,25 +140,25 @@ export function GameBoard({
     const squares: InteractiveSquare[] = []
     for (const piece of view.pieces) {
       if (piece.side !== view.perspective) continue
-      const display = toDisplayPosition(piece.position, view.perspective)
+      const display = toDisplayPosition(piece.position, orientation)
       squares.push({
         position: piece.position,
         displayFile: display.file,
         displayRank: display.rank,
         kind: 'piece',
-        label: `选择${sideNames[piece.side]}${pieceNames[piece.side][piece.type]}，${squareLabel(piece.position)}`,
+        label: `选择${sideNames[piece.side]}${pieceNames[piece.side][piece.type]}，${squareLabel(piece.position, orientation)}`,
       })
     }
     if (selected) {
       const selectedPiece = piecesByPosition.get(positionKey(selected))
       for (const destination of destinations) {
-        const display = toDisplayPosition(destination, view.perspective)
+        const display = toDisplayPosition(destination, orientation)
         squares.push({
           position: destination,
           displayFile: display.file,
           displayRank: display.rank,
           kind: 'destination',
-          label: `将${selectedPiece ? pieceNames[selectedPiece.side][selectedPiece.type] : '棋子'}移动到${squareLabel(destination)}`,
+          label: `将${selectedPiece ? pieceNames[selectedPiece.side][selectedPiece.type] : '棋子'}移动到${squareLabel(destination, orientation)}`,
         })
       }
     }
@@ -158,7 +167,7 @@ export function GameBoard({
         right.displayRank - left.displayRank ||
         left.displayFile - right.displayFile,
     )
-  }, [destinations, piecesByPosition, selected, view.perspective, view.pieces])
+  }, [destinations, orientation, piecesByPosition, selected, view.perspective, view.pieces])
 
   const activateSquare = (square: InteractiveSquare) => {
     if (interactionLocked || !isPlayerTurn) return
@@ -173,7 +182,7 @@ export function GameBoard({
 
   return (
     <div
-      className={`game-board${interactionLocked ? ' game-board--locked' : ''}`}
+      className={`game-board${interactionLocked ? ' game-board--locked' : ''}${isPlayableTurn ? ' game-board--my-turn' : ''}`}
       aria-busy={interactionLocked}
       data-testid="game-board"
     >
@@ -192,6 +201,18 @@ export function GameBoard({
           <pattern id="fog-pattern" width="10" height="10" patternUnits="userSpaceOnUse">
             <rect width="10" height="10" fill="#172321" />
             <path d="M0 10 10 0" stroke="#273936" strokeWidth="2" />
+          </pattern>
+          <pattern id="red-blind-pattern" width="12" height="12" patternUnits="userSpaceOnUse">
+            <rect width="12" height="12" fill="#b4232f" fillOpacity="0.28" />
+            <path d="M-3 12 12 -3 M3 15 15 3" stroke="#e85b63" strokeOpacity="0.42" strokeWidth="2" />
+          </pattern>
+          <pattern id="black-blind-pattern" width="12" height="12" patternUnits="userSpaceOnUse">
+            <rect width="12" height="12" fill="#101716" fillOpacity="0.32" />
+            <path d="M-3 -3 15 15 M-3 9 3 15" stroke="#45504e" strokeOpacity="0.5" strokeWidth="2" />
+          </pattern>
+          <pattern id="both-blind-pattern" width="12" height="12" patternUnits="userSpaceOnUse">
+            <rect width="12" height="12" fill="#b4232f" fillOpacity="0.24" />
+            <path d="M-3 -3 15 15 M-3 9 3 15" stroke="#101716" strokeOpacity="0.72" strokeWidth="5" />
           </pattern>
         </defs>
         <rect x="1" y="1" width="581" height="581" rx="20" className="board-frame" />
@@ -220,8 +241,8 @@ export function GameBoard({
         </g>
         <g className="fog-layer" aria-hidden="true">
           {allPositions.map((position) => {
-            if (visibleKeys.has(positionKey(position))) return null
-            const point = boardPoint(position, view.perspective)
+            if (omniscientVisibleKeys || visibleKeys.has(positionKey(position))) return null
+            const point = boardPoint(position, orientation)
             return (
               <rect
                 key={positionKey(position)}
@@ -237,7 +258,7 @@ export function GameBoard({
           })}
         </g>
         {selected ? (() => {
-          const point = boardPoint(selected, view.perspective)
+          const point = boardPoint(selected, orientation)
           return (
             <g transform={`translate(${point.x} ${point.y})`} aria-hidden="true">
               <circle r="27" className="board-selection board-horizontal-scale" />
@@ -246,7 +267,7 @@ export function GameBoard({
         })() : null}
         <g className="candidate-layer" aria-hidden="true">
           {destinations.map((destination) => {
-            const point = boardPoint(destination, view.perspective)
+            const point = boardPoint(destination, orientation)
             const occupied = piecesByPosition.has(positionKey(destination))
             return occupied ? (
               <g
@@ -271,22 +292,52 @@ export function GameBoard({
             <PieceShape
               key={`${piece.side}-${piece.type}-${positionKey(piece.position)}`}
               piece={piece}
-              perspective={view.perspective}
+              orientation={orientation}
             />
           ))}
         </g>
+        {omniscientVisibleKeys ? (
+          <g className="omniscient-visibility-layer" aria-hidden="true">
+            {allPositions.map((position) => {
+              const key = positionKey(position)
+              const redBlind = !omniscientVisibleKeys.red.has(key)
+              const blackBlind = !omniscientVisibleKeys.black.has(key)
+              if (!redBlind && !blackBlind) return null
+              const point = boardPoint(position, orientation)
+              const fill = redBlind && blackBlind
+                ? 'url(#both-blind-pattern)'
+                : redBlind
+                  ? 'url(#red-blind-pattern)'
+                  : 'url(#black-blind-pattern)'
+              return (
+                <rect
+                  key={key}
+                  x={point.x - 26}
+                  y={point.y - 26}
+                  width="52"
+                  height="52"
+                  rx="9"
+                  fill={fill}
+                  data-testid={`visibility-${key}`}
+                  data-red-blind={redBlind || undefined}
+                  data-black-blind={blackBlind || undefined}
+                />
+              )
+            })}
+          </g>
+        ) : null}
       </svg>
       <ul className="sr-only" aria-label="当前可见棋子">
         {view.pieces.map((piece) => (
           <li key={`accessible-${piece.side}-${piece.type}-${positionKey(piece.position)}`}>
             {sideNames[piece.side]}
-            {pieceNames[piece.side][piece.type]}，位于{squareLabel(piece.position)}
+            {pieceNames[piece.side][piece.type]}，位于{squareLabel(piece.position, orientation)}
           </li>
         ))}
       </ul>
       <div className="game-board__targets" aria-label="棋盘操作">
         {interactiveSquares.map((square) => {
-          const point = boardPoint(square.position, view.perspective)
+          const point = boardPoint(square.position, orientation)
           const disabled = interactionLocked || !isPlayerTurn
           return (
             <button

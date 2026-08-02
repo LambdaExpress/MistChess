@@ -415,6 +415,54 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/games/{gameId}/takeback-requests": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["createTakebackRequest"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/games/{gameId}/takeback-requests/{requestId}/accept": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["acceptTakebackRequest"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/games/{gameId}/takeback-requests/{requestId}/reject": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["rejectTakebackRequest"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/games/{gameId}/replay": {
         parameters: {
             query?: never;
@@ -600,11 +648,20 @@ export interface components {
             /** Format: int32 */
             moveTimeLimitSeconds?: null | number;
         };
+        CreateTakebackRequest: {
+            /** Format: int64 */
+            expectedVersion: number;
+            clientRequestId: string;
+        };
         /** @enum {string} */
         DrawOfferStatus: "pending" | "accepted" | "rejected" | "withdrawn";
         DrawOfferView: {
+            /** Format: uuid */
+            id: string;
             status: components["schemas"]["DrawOfferStatus"];
             offeredBy: components["schemas"]["Side"];
+            /** Format: int64 */
+            revision: number;
         };
         ErrorResponse: {
             code: string;
@@ -612,6 +669,14 @@ export interface components {
             detail?: null | string;
             /** Format: uuid */
             gameId?: null | string;
+        };
+        /** @enum {string} */
+        GameActionKind: "move" | "capture" | "takebackAccepted";
+        GameActionView: {
+            /** Format: int64 */
+            version: number;
+            kind: components["schemas"]["GameActionKind"];
+            actor: components["schemas"]["Side"];
         };
         GameOptionsView: {
             ruleVersion: string;
@@ -650,6 +715,11 @@ export interface components {
             captureSummary: components["schemas"]["CaptureSummaryView"];
             clock: null | components["schemas"]["ClockView"];
             drawOffer: null | components["schemas"]["DrawOfferView"];
+            /** Format: int64 */
+            negotiationVersion: number;
+            takebackRequest: null | components["schemas"]["TakebackRequestView"];
+            lastAction: null | components["schemas"]["GameActionView"];
+            canRequestTakeback: boolean;
             /** Format: int32 */
             moveTimeLimitSeconds?: null | number;
         };
@@ -797,6 +867,24 @@ export interface components {
         };
         /** @enum {string} */
         Side: "red" | "black";
+        /** @enum {string} */
+        TakebackRequestStatus: "pending" | "accepted" | "rejected" | "withdrawn";
+        TakebackRequestView: {
+            /** Format: uuid */
+            id: string;
+            status: components["schemas"]["TakebackRequestStatus"];
+            requestedBy: components["schemas"]["Side"];
+            /** Format: int32 */
+            requestedPly: number;
+            /** Format: int64 */
+            requestedAtVersion: number;
+            /** Format: int64 */
+            resolvedAtVersion: null | number;
+            /** Format: date-time */
+            createdAt: string;
+            /** Format: int64 */
+            revision: number;
+        };
         TimeControlOptionView: {
             id: string;
             label: string;
@@ -1764,6 +1852,119 @@ export interface operations {
                     "text/plain": components["schemas"]["DrawOfferView"];
                     "application/json": components["schemas"]["DrawOfferView"];
                     "text/json": components["schemas"]["DrawOfferView"];
+                };
+            };
+        };
+    };
+    createTakebackRequest: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                gameId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateTakebackRequest"];
+                "text/json": components["schemas"]["CreateTakebackRequest"];
+                "application/*+json": components["schemas"]["CreateTakebackRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": components["schemas"]["TakebackRequestView"];
+                    "application/json": components["schemas"]["TakebackRequestView"];
+                    "text/json": components["schemas"]["TakebackRequestView"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": components["schemas"]["ErrorResponse"];
+                    "application/json": components["schemas"]["ErrorResponse"];
+                    "text/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    acceptTakebackRequest: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                gameId: string;
+                requestId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": components["schemas"]["GameView"];
+                    "application/json": components["schemas"]["GameView"];
+                    "text/json": components["schemas"]["GameView"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": components["schemas"]["ErrorResponse"];
+                    "application/json": components["schemas"]["ErrorResponse"];
+                    "text/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    rejectTakebackRequest: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                gameId: string;
+                requestId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": components["schemas"]["TakebackRequestView"];
+                    "application/json": components["schemas"]["TakebackRequestView"];
+                    "text/json": components["schemas"]["TakebackRequestView"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": components["schemas"]["ErrorResponse"];
+                    "application/json": components["schemas"]["ErrorResponse"];
+                    "text/json": components["schemas"]["ErrorResponse"];
                 };
             };
         };

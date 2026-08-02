@@ -9,6 +9,10 @@ import {
   type AdminUserDetail,
   type AdminUsersPage,
   type AdminUsersParams,
+  type CreateTakebackRequest,
+  type DrawOffer,
+  type GameView,
+  type TakebackRequestView,
 } from './types'
 
 type ApiProblem = components['schemas']['ErrorResponse'] & Record<string, unknown>
@@ -265,33 +269,49 @@ export const api = {
     ),
 
   getGame: (gameId: string) =>
-    requestJson<'getGame'>(`/api/games/${encodeURIComponent(gameId)}`),
+    request<GameView>(`/api/games/${encodeURIComponent(gameId)}`),
 
   submitMove: (gameId: string, move: JsonRequest<'submitMove'>) =>
-    requestJson<'submitMove'>(`/api/games/${encodeURIComponent(gameId)}/moves`, {
+    request<GameView>(`/api/games/${encodeURIComponent(gameId)}/moves`, {
       method: 'POST',
       body: jsonBody<JsonRequest<'submitMove'>>(move),
     }),
 
   resignGame: (gameId: string) =>
-    requestJson<'resignGame'>(`/api/games/${encodeURIComponent(gameId)}/resign`, {
+    request<GameView>(`/api/games/${encodeURIComponent(gameId)}/resign`, {
       method: 'POST',
     }),
 
   offerDraw: (gameId: string) =>
-    requestJson<'offerDraw'>(`/api/games/${encodeURIComponent(gameId)}/draw-offers`, {
+    request<DrawOffer>(`/api/games/${encodeURIComponent(gameId)}/draw-offers`, {
       method: 'POST',
     }),
 
   acceptDraw: (gameId: string) =>
-    requestJson<'acceptDraw'>(
-      `/api/games/${encodeURIComponent(gameId)}/draw-offers/accept`,
+    request<GameView>(`/api/games/${encodeURIComponent(gameId)}/draw-offers/accept`, {
+      method: 'POST',
+    }),
+
+  rejectDraw: (gameId: string) =>
+    request<DrawOffer>(`/api/games/${encodeURIComponent(gameId)}/draw-offers/reject`, {
+      method: 'POST',
+    }),
+
+  createTakebackRequest: (gameId: string, takeback: CreateTakebackRequest) =>
+    request<TakebackRequestView>(
+      `/api/games/${encodeURIComponent(gameId)}/takeback-requests`,
+      { method: 'POST', body: jsonBody(takeback) },
+    ),
+
+  acceptTakebackRequest: (gameId: string, requestId: string) =>
+    request<GameView>(
+      `/api/games/${encodeURIComponent(gameId)}/takeback-requests/${encodeURIComponent(requestId)}/accept`,
       { method: 'POST' },
     ),
 
-  rejectDraw: (gameId: string) =>
-    requestJson<'rejectDraw'>(
-      `/api/games/${encodeURIComponent(gameId)}/draw-offers/reject`,
+  rejectTakebackRequest: (gameId: string, requestId: string) =>
+    request<TakebackRequestView>(
+      `/api/games/${encodeURIComponent(gameId)}/takeback-requests/${encodeURIComponent(requestId)}/reject`,
       { method: 'POST' },
     ),
 

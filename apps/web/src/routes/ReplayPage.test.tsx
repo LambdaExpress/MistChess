@@ -1,10 +1,11 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { MemoryRouter, Route, Routes } from 'react-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { api } from '../api/client'
 import { queryKeys } from '../api/queryKeys'
 import type { GuestSession, HistoricalReplay, ReplayProjection } from '../api/types'
+import { audioService } from '../features/audio/audioService'
 import { ReplayPage } from './ReplayPage'
 
 const session: GuestSession = {
@@ -115,8 +116,9 @@ afterEach(() => {
 })
 
 describe('ReplayPage', () => {
-  it('switches cached views without refetching or resetting the current frame', async () => {
+  it('keeps information, orientation, frame, and forward-only audio independent', async () => {
     const getReplay = vi.spyOn(api, 'getReplay').mockResolvedValue(replay('red'))
+    const emitReplay = vi.spyOn(audioService, 'emitReplay').mockImplementation(() => {})
     vi.spyOn(api, 'createReplayShare').mockResolvedValue({
       sharePath: '/shared/replay/share-token',
       createdAt: '2026-07-27T00:00:00Z',
@@ -125,15 +127,57 @@ describe('ReplayPage', () => {
 
     renderReplayPage()
     await screen.findByRole('heading', { name: '迷雾棋局回放' })
-    expect(screen.getByRole('button', { name: '红方视野' })).toHaveAttribute('aria-pressed', 'true')
+    const information = screen.getByRole('group', { name: '信息视野' })
+    const orientation = screen.getByRole('group', { name: '棋盘朝向' })
+    const previous = screen.getByRole('button', { name: '上一步' })
+    const next = screen.getByRole('button', { name: '下一步' })
 
-    fireEvent.click(screen.getByRole('button', { name: '下一步' }))
-    expect(await screen.findByText('红方车')).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: '黑方视野' }))
-    expect(screen.getByText('对手走子或终局事件')).toBeInTheDocument()
-    expect(screen.getByText('1', { selector: '.replay-counter > strong' })).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: '全局视野' }))
-    expect(screen.getByText('红方车')).toBeInTheDocument()
+    expect(within(information).getByRole('button', { name: '红方视野' }))
+      .toHaveAttribute('aria-pressed', 'true')
+    expect(within(orientation).getByRole('button', { name: '红方在下' }))
+      .toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByLabelText('当前第 0 步，共 2 步')).toHaveTextContent('0 / 2')
+    expect(previous).toBeDisabled()
+    expect(next).toBeEnabled()
+    expect(screen.queryByRole('slider')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /跳到/ })).not.toBeInTheDocument()
+
+    fireEvent.click(next)
+    expect(await screen.findByLabelText(/红方车，位于/)).toBeInTheDocument()
+    expect(screen.getByRole('img', {
+      name: '红方视野，红方在下，第 1 个半回合',
+    })).toBeInTheDocument()
+    expect(emitReplay).toHaveBeenCalledWith(expect.any(String), 1, ['move-opponent'])
+
+    fireEvent.click(within(orientation).getByRole('button', { name: '黑方在下' }))
+    expect(within(information).getByRole('button', { name: '红方视野' }))
+      .toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByRole('img', {
+      name: '红方视野，黑方在下，第 1 个半回合',
+    })).toBeInTheDocument()
+
+    fireEvent.click(within(information).getByRole('button', { name: '黑方视野' }))
+    expect(within(orientation).getByRole('button', { name: '黑方在下' }))
+      .toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByRole('img', {
+      name: '黑方视野，黑方在下，第 1 个半回合',
+    })).toBeInTheDocument()
+    expect(screen.getByLabelText('当前第 1 步，共 2 步')).toHaveTextContent('1 / 2')
+
+    emitReplay.mockClear()
+    fireEvent.click(previous)
+    expect(emitReplay).not.toHaveBeenCalled()
+    fireEvent.click(next)
+    expect(emitReplay).toHaveBeenCalledWith(expect.any(String), 2, ['move-opponent'])
+
+    fireEvent.click(within(information).getByRole('button', { name: '全局视野' }))
+    expect(within(orientation).getByRole('button', { name: '黑方在下' }))
+      .toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByRole('img', {
+      name: '全局视野，黑方在下，第 1 个半回合',
+    })).toBeInTheDocument()
+    expect(screen.getByLabelText('全局视野图例'))
+      .toHaveTextContent('红方盲区黑方盲区双方盲区双方可见')
     expect(getReplay).toHaveBeenCalledOnce()
 
     fireEvent.click(screen.getByRole('button', { name: '生成分享链接' }))
@@ -145,6 +189,30 @@ describe('ReplayPage', () => {
     ))
     fireEvent.click(screen.getByRole('button', { name: '撤销当前分享' }))
     await waitFor(() => expect(screen.queryByRole('textbox', { name: '分享链接' })).not.toBeInTheDocument())
+  })
+
+  it('queues a final capture before the replay result sound', async () => {
+    const terminalReplay = replay('red')
+    const terminalCapture: NonNullable<ReplayProjection['move']> = {
+      ...redMove,
+      ply: 2,
+      side: 'black',
+      captured: 'general',
+    }
+    terminalReplay.frames[2].views.omniscient.move = terminalCapture
+    vi.spyOn(api, 'getReplay').mockResolvedValue(terminalReplay)
+    const emitReplay = vi.spyOn(audioService, 'emitReplay').mockImplementation(() => {})
+
+    renderReplayPage()
+    await screen.findByRole('heading', { name: '迷雾棋局回放' })
+    fireEvent.click(screen.getByRole('button', { name: '下一步' }))
+    fireEvent.click(screen.getByRole('button', { name: '下一步' }))
+
+    expect(emitReplay).toHaveBeenLastCalledWith(
+      expect.any(String),
+      2,
+      ['capture', 'game-win'],
+    )
   })
 
   it('loads a shared route without secure-context APIs or exposing the token in query keys', async () => {

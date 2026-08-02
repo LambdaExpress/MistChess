@@ -15,6 +15,7 @@ public sealed class MistChessDbContext(DbContextOptions<MistChessDbContext> opti
     public DbSet<MoveEntity> Moves => Set<MoveEntity>();
     public DbSet<MoveCommandReceiptEntity> MoveCommandReceipts => Set<MoveCommandReceiptEntity>();
     public DbSet<DrawOfferEntity> DrawOffers => Set<DrawOfferEntity>();
+    public DbSet<TakebackRequestEntity> TakebackRequests => Set<TakebackRequestEntity>();
     public DbSet<PlayerRatingEntity> PlayerRatings => Set<PlayerRatingEntity>();
     public DbSet<RatingSettlementEntity> RatingSettlements => Set<RatingSettlementEntity>();
     public DbSet<ReplayShareEntity> ReplayShares => Set<ReplayShareEntity>();
@@ -30,6 +31,7 @@ public sealed class MistChessDbContext(DbContextOptions<MistChessDbContext> opti
         ConfigureMoves(modelBuilder);
         ConfigureMoveCommandReceipts(modelBuilder);
         ConfigureDrawOffers(modelBuilder);
+        ConfigureTakebackRequests(modelBuilder);
         ConfigurePlayerRatings(modelBuilder);
         ConfigureRatingSettlements(modelBuilder);
         ConfigureReplayShares(modelBuilder);
@@ -157,6 +159,8 @@ public sealed class MistChessDbContext(DbContextOptions<MistChessDbContext> opti
             table.HasCheckConstraint("ck_games_clock", "(time_control IS NULL AND red_milliseconds IS NULL AND black_milliseconds IS NULL AND turn_started_at IS NULL AND move_time_limit_milliseconds IS NULL AND turn_milliseconds IS NULL) OR (time_control IS NOT NULL AND red_milliseconds >= 0 AND black_milliseconds >= 0 AND ((move_time_limit_milliseconds IS NULL AND turn_milliseconds IS NULL) OR (move_time_limit_milliseconds > 0 AND turn_milliseconds BETWEEN 0 AND move_time_limit_milliseconds)))");
             table.HasCheckConstraint("ck_games_rated_time_control", "NOT is_rated OR (time_control = '600+5' AND move_time_limit_milliseconds = 90000)");
             table.HasCheckConstraint("ck_games_clock_expiry", "(time_control IS NULL AND clock_expires_at IS NULL) OR (time_control IS NOT NULL AND ((status = 'Playing' AND clock_expires_at IS NOT NULL) OR (status = 'Finished' AND clock_expires_at IS NULL)))");
+            table.HasCheckConstraint("ck_games_last_action", "(last_action_version IS NULL AND last_action_kind IS NULL AND last_action_actor IS NULL) OR (last_action_version IS NOT NULL AND last_action_version >= 0 AND last_action_version <= version AND last_action_kind IN ('move', 'capture', 'takebackAccepted') AND last_action_actor IN ('Red', 'Black'))");
+            table.HasCheckConstraint("ck_games_negotiation_version", "negotiation_version >= 0");
         });
         entity.HasKey(value => value.Id);
         entity.Property(value => value.Id).HasColumnName("id");
@@ -178,6 +182,11 @@ public sealed class MistChessDbContext(DbContextOptions<MistChessDbContext> opti
         entity.Property(value => value.TurnStartedAt).HasColumnName("turn_started_at");
         entity.Property(value => value.ClockExpiresAt).HasColumnName("clock_expires_at");
         entity.Property(value => value.Version).HasColumnName("version").IsConcurrencyToken();
+        entity.Property(value => value.LastActionVersion).HasColumnName("last_action_version");
+        entity.Property(value => value.LastActionKind).HasColumnName("last_action_kind").HasMaxLength(32);
+        entity.Property(value => value.LastActionActor).HasColumnName("last_action_actor").HasConversion<string>().HasMaxLength(8);
+        entity.Property(value => value.NegotiationVersion).HasColumnName("negotiation_version").HasDefaultValue(0L);
+        entity.Property(value => value.TakebackWindowConsumed).HasColumnName("takeback_window_consumed").HasDefaultValue(false);
         entity.Property(value => value.CreatedAt).HasColumnName("created_at");
         entity.Property(value => value.UpdatedAt).HasColumnName("updated_at");
         entity.Property(value => value.FinishedAt).HasColumnName("finished_at");
@@ -222,6 +231,7 @@ public sealed class MistChessDbContext(DbContextOptions<MistChessDbContext> opti
             table.HasCheckConstraint("ck_moves_from", "from_file BETWEEN 0 AND 8 AND from_rank BETWEEN 0 AND 9");
             table.HasCheckConstraint("ck_moves_to", "to_file BETWEEN 0 AND 8 AND to_rank BETWEEN 0 AND 9");
             table.HasCheckConstraint("ck_moves_ply", "ply > 0");
+            table.HasCheckConstraint("ck_moves_reverted", "(reverted_at IS NULL AND reverted_by_takeback_request_id IS NULL) OR (reverted_at IS NOT NULL AND reverted_by_takeback_request_id IS NOT NULL)");
         });
         entity.HasKey(value => value.Id);
         entity.Property(value => value.Id).HasColumnName("id");
@@ -235,6 +245,7 @@ public sealed class MistChessDbContext(DbContextOptions<MistChessDbContext> opti
         entity.Property(value => value.MovingPieceType).HasColumnName("moving_piece_type").HasConversion<string>().HasMaxLength(16);
         entity.Property(value => value.CapturedPieceType).HasColumnName("captured_piece_type").HasConversion<string>().HasMaxLength(16);
         entity.Property(value => value.ElapsedMilliseconds).HasColumnName("elapsed_milliseconds");
+        entity.Property(value => value.TurnMillisecondsBefore).HasColumnName("turn_milliseconds_before");
         entity.Property(value => value.ClientMoveId).HasColumnName("client_move_id").HasMaxLength(64).IsRequired();
         entity.Property(value => value.PositionKey).HasColumnName("position_key").HasMaxLength(256).IsRequired();
         entity.Property(value => value.StateAfterJson).HasColumnName("state_after").HasColumnType("jsonb").IsRequired();
@@ -245,9 +256,12 @@ public sealed class MistChessDbContext(DbContextOptions<MistChessDbContext> opti
         entity.Property(value => value.BlackMillisecondsAfter).HasColumnName("black_milliseconds_after");
         entity.Property(value => value.TurnStartedAtAfter).HasColumnName("turn_started_at_after");
         entity.Property(value => value.TurnMillisecondsAfter).HasColumnName("turn_milliseconds_after");
+        entity.Property(value => value.RevertedAt).HasColumnName("reverted_at");
+        entity.Property(value => value.RevertedByTakebackRequestId).HasColumnName("reverted_by_takeback_request_id");
         entity.Property(value => value.CreatedAt).HasColumnName("created_at");
-        entity.HasIndex(value => new { value.GameId, value.Ply }).IsUnique().HasDatabaseName("ux_moves_game_ply");
+        entity.HasIndex(value => new { value.GameId, value.Ply }).IsUnique().HasFilter("\"reverted_at\" IS NULL").HasDatabaseName("ux_moves_game_ply");
         entity.HasIndex(value => new { value.GameId, value.ClientMoveId }).IsUnique().HasDatabaseName("ux_moves_game_client_move");
+        entity.HasIndex(value => value.RevertedByTakebackRequestId).IsUnique().HasFilter("\"reverted_by_takeback_request_id\" IS NOT NULL").HasDatabaseName("ux_moves_reverted_takeback_request");
         entity.HasOne(value => value.Game).WithMany(value => value.Moves).HasForeignKey(value => value.GameId).OnDelete(DeleteBehavior.Cascade);
     }
 
@@ -296,6 +310,36 @@ public sealed class MistChessDbContext(DbContextOptions<MistChessDbContext> opti
         entity.HasIndex(value => value.GameId).IsUnique().HasFilter("\"status\" = 'Pending'").HasDatabaseName("ux_draw_offers_pending_game");
         entity.HasOne(value => value.Game).WithMany(value => value.DrawOffers).HasForeignKey(value => value.GameId).OnDelete(DeleteBehavior.Cascade);
         entity.HasOne(value => value.OfferedByPlayer).WithMany().HasForeignKey(value => value.OfferedByPlayerId).OnDelete(DeleteBehavior.Restrict);
+    }
+
+    private static void ConfigureTakebackRequests(ModelBuilder modelBuilder)
+    {
+        var entity = modelBuilder.Entity<TakebackRequestEntity>();
+        entity.ToTable("takeback_requests", table =>
+        {
+            table.HasCheckConstraint("ck_takeback_requests_status", "status IN ('Pending', 'Accepted', 'Rejected', 'Withdrawn')");
+            table.HasCheckConstraint("ck_takeback_requests_ply", "requested_ply > 0");
+            table.HasCheckConstraint("ck_takeback_requests_versions", "requested_at_version >= 0 AND resolved_at_version >= 0");
+            table.HasCheckConstraint("ck_takeback_requests_resolution", "(status = 'Pending' AND resolved_at_version IS NULL) OR (status <> 'Pending' AND resolved_at_version IS NOT NULL)");
+        });
+        entity.HasKey(value => value.Id);
+        entity.Property(value => value.Id).HasColumnName("id");
+        entity.Property(value => value.GameId).HasColumnName("game_id");
+        entity.Property(value => value.RequestedByPlayerId).HasColumnName("requested_by_player_id");
+        entity.Property(value => value.MoveId).HasColumnName("move_id");
+        entity.Property(value => value.RequestedPly).HasColumnName("requested_ply");
+        entity.Property(value => value.RequestedAtVersion).HasColumnName("requested_at_version");
+        entity.Property(value => value.ResolvedAtVersion).HasColumnName("resolved_at_version");
+        entity.Property(value => value.ClientRequestId).HasColumnName("client_request_id").HasMaxLength(64).IsRequired();
+        entity.Property(value => value.Status).HasColumnName("status").HasConversion<string>().HasMaxLength(16);
+        entity.Property(value => value.CreatedAt).HasColumnName("created_at");
+        entity.Property(value => value.UpdatedAt).HasColumnName("updated_at");
+        entity.HasIndex(value => new { value.GameId, value.RequestedByPlayerId, value.ClientRequestId }).IsUnique().HasDatabaseName("ux_takeback_requests_game_player_client_request");
+        entity.HasIndex(value => value.MoveId).IsUnique().HasDatabaseName("ux_takeback_requests_move");
+        entity.HasIndex(value => value.GameId).IsUnique().HasFilter("\"status\" = 'Pending'").HasDatabaseName("ux_takeback_requests_pending_game");
+        entity.HasOne(value => value.Game).WithMany(value => value.TakebackRequests).HasForeignKey(value => value.GameId).OnDelete(DeleteBehavior.Cascade);
+        entity.HasOne(value => value.RequestedByPlayer).WithMany().HasForeignKey(value => value.RequestedByPlayerId).OnDelete(DeleteBehavior.Restrict);
+        entity.HasOne(value => value.Move).WithMany().HasForeignKey(value => value.MoveId).OnDelete(DeleteBehavior.NoAction);
     }
 
     private static void ConfigurePlayerRatings(ModelBuilder modelBuilder)

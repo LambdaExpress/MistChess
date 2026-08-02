@@ -18,6 +18,14 @@ public enum DrawOfferStatus
     Withdrawn
 }
 
+public enum TakebackRequestStatus
+{
+    Pending,
+    Accepted,
+    Rejected,
+    Withdrawn
+}
+
 public sealed class GuestSessionEntity
 {
     public Guid Id { get; set; }
@@ -106,9 +114,15 @@ public sealed class GameEntity
     public DateTimeOffset CreatedAt { get; set; }
     public DateTimeOffset UpdatedAt { get; set; }
     public DateTimeOffset? FinishedAt { get; set; }
+    public long? LastActionVersion { get; set; }
+    public string? LastActionKind { get; set; }
+    public Side? LastActionActor { get; set; }
+    public long NegotiationVersion { get; set; }
+    public bool TakebackWindowConsumed { get; set; }
     public List<MoveEntity> Moves { get; set; } = [];
     public List<MoveCommandReceiptEntity> MoveCommandReceipts { get; set; } = [];
     public List<DrawOfferEntity> DrawOffers { get; set; } = [];
+    public List<TakebackRequestEntity> TakebackRequests { get; set; } = [];
     public List<GamePlayerEntity> Players { get; set; } = [];
     public RatingSettlementEntity? RatingSettlement { get; set; }
     public List<ReplayShareEntity> ReplayShares { get; set; } = [];
@@ -138,6 +152,7 @@ public sealed class MoveEntity
     public PieceType MovingPieceType { get; set; }
     public PieceType? CapturedPieceType { get; set; }
     public long ElapsedMilliseconds { get; set; }
+    public long? TurnMillisecondsBefore { get; set; }
     public required string ClientMoveId { get; set; }
     public required string PositionKey { get; set; }
     public required string StateAfterJson { get; set; }
@@ -148,6 +163,8 @@ public sealed class MoveEntity
     public long? BlackMillisecondsAfter { get; set; }
     public DateTimeOffset? TurnStartedAtAfter { get; set; }
     public long? TurnMillisecondsAfter { get; set; }
+    public DateTimeOffset? RevertedAt { get; set; }
+    public Guid? RevertedByTakebackRequestId { get; set; }
     public DateTimeOffset CreatedAt { get; set; }
 }
 
@@ -178,6 +195,24 @@ public sealed class DrawOfferEntity
     public Guid OfferedByPlayerId { get; set; }
     public GuestSessionEntity OfferedByPlayer { get; set; } = null!;
     public DrawOfferStatus Status { get; set; }
+    public DateTimeOffset CreatedAt { get; set; }
+    public DateTimeOffset UpdatedAt { get; set; }
+}
+
+public sealed class TakebackRequestEntity
+{
+    public Guid Id { get; set; }
+    public Guid GameId { get; set; }
+    public GameEntity Game { get; set; } = null!;
+    public Guid RequestedByPlayerId { get; set; }
+    public GuestSessionEntity RequestedByPlayer { get; set; } = null!;
+    public Guid MoveId { get; set; }
+    public MoveEntity Move { get; set; } = null!;
+    public int RequestedPly { get; set; }
+    public long RequestedAtVersion { get; set; }
+    public long? ResolvedAtVersion { get; set; }
+    public required string ClientRequestId { get; set; }
+    public TakebackRequestStatus Status { get; set; }
     public DateTimeOffset CreatedAt { get; set; }
     public DateTimeOffset UpdatedAt { get; set; }
 }

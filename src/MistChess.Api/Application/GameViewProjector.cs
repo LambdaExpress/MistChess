@@ -10,9 +10,15 @@ namespace MistChess.Api.Application;
 
 public sealed class GameViewProjector(IGameStateSerializer stateSerializer, TimeProvider timeProvider)
 {
-    public ApiGameView Project(GameEntity game, Guid playerId, DrawOfferView? drawOffer = null)
+    public ApiGameView Project(
+        GameEntity game,
+        Guid playerId,
+        DrawOfferView? drawOffer = null,
+        TakebackRequestView? takebackRequest = null,
+        MoveEntity? latestEffectiveMove = null)
     {
         var state = stateSerializer.Deserialize(game.StateJson);
+        var perspective = GameFactory.GetSide(game, playerId);
         return ProjectCore(
             game.Id,
             game.RuleVersion,
@@ -26,16 +32,28 @@ public sealed class GameViewProjector(IGameStateSerializer stateSerializer, Time
             game.BlackMilliseconds,
             game.TurnStartedAt,
             game.TurnMilliseconds,
+            game.NegotiationVersion,
             state,
-            GameFactory.GetSide(game, playerId),
+            perspective,
             timeProvider.GetUtcNow(),
-            drawOffer);
+            drawOffer,
+            takebackRequest,
+            MapLastAction(game),
+            CanRequestTakeback(game, perspective, drawOffer, takebackRequest, latestEffectiveMove));
     }
 
-    public ApiGameView ProjectHistoricalMove(GameEntity game, MoveEntity move, Guid playerId)
+    public ApiGameView ProjectHistoricalMove(
+        GameEntity game,
+        MoveEntity move,
+        Guid playerId,
+        DrawOfferView? drawOffer = null,
+        TakebackRequestView? takebackRequest = null,
+        MoveEntity? latestEffectiveMove = null)
     {
         var state = stateSerializer.Deserialize(move.StateAfterJson);
         var status = move.ResultReasonAfter is null ? state.Status : GameStatus.Finished;
+        var perspective = GameFactory.GetSide(game, playerId);
+        latestEffectiveMove ??= game.Version == move.GameVersion && move.RevertedAt is null ? move : null;
         return ProjectCore(
             game.Id,
             game.RuleVersion,
@@ -49,18 +67,27 @@ public sealed class GameViewProjector(IGameStateSerializer stateSerializer, Time
             move.BlackMillisecondsAfter,
             move.TurnStartedAtAfter,
             move.TurnMillisecondsAfter,
+            game.NegotiationVersion,
             state,
-            GameFactory.GetSide(game, playerId),
+            perspective,
             move.CreatedAt,
-            null);
+            drawOffer,
+            takebackRequest,
+            game.LastActionVersion == move.GameVersion ? MapLastAction(game) : null,
+            game.Version == move.GameVersion &&
+                CanRequestTakeback(game, perspective, drawOffer, takebackRequest, latestEffectiveMove));
     }
     public ApiGameView ProjectHistoricalCommand(
         GameEntity game,
         MoveCommandReceiptEntity receipt,
-        Guid playerId)
+        Guid playerId,
+        DrawOfferView? drawOffer = null,
+        TakebackRequestView? takebackRequest = null,
+        MoveEntity? latestEffectiveMove = null)
     {
         var state = stateSerializer.Deserialize(receipt.StateAfterJson);
         var status = receipt.ResultReasonAfter is null ? state.Status : GameStatus.Finished;
+        var perspective = GameFactory.GetSide(game, playerId);
         return ProjectCore(
             game.Id,
             game.RuleVersion,
@@ -74,10 +101,15 @@ public sealed class GameViewProjector(IGameStateSerializer stateSerializer, Time
             receipt.BlackMillisecondsAfter,
             receipt.TurnStartedAtAfter,
             receipt.TurnMillisecondsAfter,
+            game.NegotiationVersion,
             state,
-            GameFactory.GetSide(game, playerId),
+            perspective,
             receipt.CreatedAt,
-            null);
+            drawOffer,
+            takebackRequest,
+            game.LastActionVersion == receipt.GameVersion ? MapLastAction(game) : null,
+            game.Version == receipt.GameVersion &&
+                CanRequestTakeback(game, perspective, drawOffer, takebackRequest, latestEffectiveMove));
     }
 
 
@@ -132,6 +164,7 @@ public sealed class GameViewProjector(IGameStateSerializer stateSerializer, Time
     }
 
     public static DrawOfferView MapDrawOffer(GameEntity game, DrawOfferEntity offer) => new(
+        offer.Id,
         offer.Status switch
         {
             MistChess.Infrastructure.Persistence.DrawOfferStatus.Pending => MistChess.Api.Contracts.DrawOfferStatus.Pending,
@@ -140,7 +173,25 @@ public sealed class GameViewProjector(IGameStateSerializer stateSerializer, Time
             MistChess.Infrastructure.Persistence.DrawOfferStatus.Withdrawn => MistChess.Api.Contracts.DrawOfferStatus.Withdrawn,
             _ => throw new ArgumentOutOfRangeException(nameof(offer))
         },
-        GameFactory.GetSide(game, offer.OfferedByPlayerId));
+        GameFactory.GetSide(game, offer.OfferedByPlayerId),
+        game.NegotiationVersion);
+
+    public static TakebackRequestView MapTakebackRequest(GameEntity game, TakebackRequestEntity request) => new(
+        request.Id,
+        request.Status switch
+        {
+            MistChess.Infrastructure.Persistence.TakebackRequestStatus.Pending => MistChess.Api.Contracts.TakebackRequestStatus.Pending,
+            MistChess.Infrastructure.Persistence.TakebackRequestStatus.Accepted => MistChess.Api.Contracts.TakebackRequestStatus.Accepted,
+            MistChess.Infrastructure.Persistence.TakebackRequestStatus.Rejected => MistChess.Api.Contracts.TakebackRequestStatus.Rejected,
+            MistChess.Infrastructure.Persistence.TakebackRequestStatus.Withdrawn => MistChess.Api.Contracts.TakebackRequestStatus.Withdrawn,
+            _ => throw new ArgumentOutOfRangeException(nameof(request))
+        },
+        GameFactory.GetSide(game, request.RequestedByPlayerId),
+        request.RequestedPly,
+        request.RequestedAtVersion,
+        request.ResolvedAtVersion,
+        request.CreatedAt,
+        game.NegotiationVersion);
 
     public static string PersistReason(GameEndReason reason) => reason switch
     {
@@ -168,10 +219,14 @@ public sealed class GameViewProjector(IGameStateSerializer stateSerializer, Time
         long? blackMilliseconds,
         DateTimeOffset? turnStartedAt,
         long? turnMilliseconds,
+        long negotiationVersion,
         GameState state,
         Side perspective,
         DateTimeOffset now,
-        DrawOfferView? drawOffer)
+        DrawOfferView? drawOffer,
+        TakebackRequestView? takebackRequest,
+        GameActionView? lastAction,
+        bool canRequestTakeback)
     {
         if (!StringComparer.Ordinal.Equals(ruleVersion, state.RuleVersion))
         {
@@ -198,7 +253,11 @@ public sealed class GameViewProjector(IGameStateSerializer stateSerializer, Time
             result,
             domainProjection,
             clock,
-            drawOffer);
+            drawOffer,
+            negotiationVersion,
+            takebackRequest,
+            lastAction,
+            canRequestTakeback);
     }
 
     private static GameState PrepareProjectionState(
@@ -229,7 +288,11 @@ public sealed class GameViewProjector(IGameStateSerializer stateSerializer, Time
         GameResultView? result,
         DomainGameView projection,
         ClockView? clock,
-        DrawOfferView? drawOffer)
+        DrawOfferView? drawOffer,
+        long negotiationVersion,
+        TakebackRequestView? takebackRequest,
+        GameActionView? lastAction,
+        bool canRequestTakeback)
     {
         return new ApiGameView(
             gameId,
@@ -250,9 +313,50 @@ public sealed class GameViewProjector(IGameStateSerializer stateSerializer, Time
                 projection.CaptureSummary.BlackLost.ToArray()),
             clock,
             status == GameStatus.Playing ? drawOffer : null,
+            negotiationVersion,
+            status == GameStatus.Playing ? takebackRequest : null,
+            lastAction,
+            status == GameStatus.Playing && canRequestTakeback,
             moveTimeLimitSeconds);
     }
 
+
+    private static GameActionView? MapLastAction(GameEntity game)
+    {
+        if (game.LastActionVersion is not { } version ||
+            game.LastActionKind is not { } kind ||
+            game.LastActionActor is not { } actor)
+        {
+            return null;
+        }
+
+        var mappedKind = kind switch
+        {
+            "move" => GameActionKind.Move,
+            "capture" => GameActionKind.Capture,
+            "takebackAccepted" => GameActionKind.TakebackAccepted,
+            _ => throw new InvalidDataException($"Persisted game action kind '{kind}' is invalid.")
+        };
+        return new GameActionView(version, mappedKind, actor);
+    }
+
+    private static bool CanRequestTakeback(
+        GameEntity game,
+        Side perspective,
+        DrawOfferView? drawOffer,
+        TakebackRequestView? takebackRequest,
+        MoveEntity? latestEffectiveMove) =>
+        game.Status == GameStatus.Playing &&
+        !game.TakebackWindowConsumed &&
+        drawOffer is null &&
+        takebackRequest is null &&
+        latestEffectiveMove is
+        {
+            RevertedAt: null
+        } move &&
+        move.GameVersion == game.Version &&
+        move.Side == perspective &&
+        game.SideToMove != perspective;
 
     private static ClockView? ComputeClock(
         long? redMilliseconds,

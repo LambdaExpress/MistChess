@@ -30,6 +30,10 @@ function createView(overrides: Partial<GameView> = {}): GameView {
     captureSummary: { redLost: [], blackLost: [] },
     clock: null,
     drawOffer: null,
+    negotiationVersion: 0,
+    takebackRequest: null,
+    lastAction: null,
+    canRequestTakeback: false,
     ...overrides,
   }
 }
@@ -127,5 +131,67 @@ describe('GameBoard', () => {
     expect(onMove).not.toHaveBeenCalled()
     expect(screen.getByTestId('piece-0:0')).toBeInTheDocument()
     expect(screen.queryByTestId('piece-0:1')).not.toBeInTheDocument()
+  })
+
+  it('highlights only an unlocked playable turn', () => {
+    const { rerender } = render(<GameBoard view={createView()} />)
+    const board = screen.getByTestId('game-board')
+
+    expect(board).toHaveClass('game-board--my-turn')
+
+    rerender(<GameBoard view={createView()} interactionLocked />)
+    expect(board).not.toHaveClass('game-board--my-turn')
+
+    rerender(<GameBoard view={createView({ sideToMove: 'black' })} />)
+    expect(board).not.toHaveClass('game-board--my-turn')
+
+    rerender(<GameBoard view={createView({ status: 'finished' })} />)
+    expect(board).not.toHaveClass('game-board--my-turn')
+  })
+
+  it('uses orientation independently from the projected player perspective', () => {
+    render(<GameBoard view={createView()} orientation="black" />)
+
+    expect(screen.getByRole('img', { name: '红方视角中国迷雾象棋棋盘' }))
+      .toBeInTheDocument()
+    expect(screen.getByTestId('piece-0:0'))
+      .toHaveAttribute('transform', 'translate(511.5 44)')
+    expect(screen.getByRole('button', { name: '选择红方车，9路、10线' }))
+      .toBeInTheDocument()
+    expect(within(screen.getByRole('list', { name: '当前可见棋子' }))
+      .getByText('红方车，位于9路、10线')).toBeInTheDocument()
+  })
+
+  it('marks red-only, black-only, and shared blind squares in omniscient view', () => {
+    render(
+      <GameBoard
+        view={createView()}
+        omniscientVisibility={{
+          red: [{ file: 0, rank: 0 }, { file: 1, rank: 0 }],
+          black: [{ file: 0, rank: 0 }, { file: 2, rank: 0 }],
+        }}
+      />,
+    )
+
+    expect(screen.queryByTestId('visibility-0:0')).not.toBeInTheDocument()
+    expect(screen.getByTestId('visibility-1:0'))
+      .toHaveAttribute('data-black-blind', 'true')
+    expect(screen.getByTestId('visibility-1:0'))
+      .not.toHaveAttribute('data-red-blind')
+    expect(screen.getByTestId('visibility-1:0'))
+      .toHaveAttribute('fill', 'url(#black-blind-pattern)')
+    expect(screen.getByTestId('visibility-2:0'))
+      .toHaveAttribute('data-red-blind', 'true')
+    expect(screen.getByTestId('visibility-2:0'))
+      .not.toHaveAttribute('data-black-blind')
+    expect(screen.getByTestId('visibility-2:0'))
+      .toHaveAttribute('fill', 'url(#red-blind-pattern)')
+    expect(screen.getByTestId('visibility-3:0'))
+      .toHaveAttribute('data-red-blind', 'true')
+    expect(screen.getByTestId('visibility-3:0'))
+      .toHaveAttribute('data-black-blind', 'true')
+    expect(screen.getByTestId('visibility-3:0'))
+      .toHaveAttribute('fill', 'url(#both-blind-pattern)')
+    expect(screen.queryByTestId('fog-3:0')).not.toBeInTheDocument()
   })
 })

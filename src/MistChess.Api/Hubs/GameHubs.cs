@@ -51,10 +51,6 @@ public sealed class GameHub(
             throw new HubException("NOT_FOUND");
         }
 
-        var drawOffer = await db.DrawOffers.AsNoTracking().SingleOrDefaultAsync(
-            value => value.GameId == game.Id &&
-                value.Status == MistChess.Infrastructure.Persistence.DrawOfferStatus.Pending,
-            Context.ConnectionAborted);
 
         Context.Items[nameof(GameEntity.Id)] = game.Id;
         Context.Items[nameof(CurrentPlayer)] = playerId;
@@ -73,18 +69,31 @@ public sealed class GameHub(
             await Clients.Group(HubGroups.GamePlayer(game.Id, opponentId))
                 .SendAsync("OpponentConnectionChanged", new ConnectionState(true), Context.ConnectionAborted);
         }
+        game = await db.Games.AsNoTracking().SingleAsync(
+            value => value.Id == gameId && (value.RedPlayerId == playerId || value.BlackPlayerId == playerId),
+            Context.ConnectionAborted);
+        var drawOffer = await db.DrawOffers.AsNoTracking().SingleOrDefaultAsync(
+            value => value.GameId == game.Id &&
+                value.Status == MistChess.Infrastructure.Persistence.DrawOfferStatus.Pending,
+            Context.ConnectionAborted);
+        var takebackRequest = await db.TakebackRequests.AsNoTracking().SingleOrDefaultAsync(
+            value => value.GameId == game.Id &&
+                value.Status == MistChess.Infrastructure.Persistence.TakebackRequestStatus.Pending,
+            Context.ConnectionAborted);
+        var latestMove = await db.Moves.AsNoTracking()
+            .Where(value => value.GameId == game.Id && value.RevertedAt == null)
+            .OrderByDescending(value => value.Ply)
+            .FirstOrDefaultAsync(Context.ConnectionAborted);
 
-        var suppliedVersion = long.TryParse(httpContext.Request.Query["version"], out var version) ? version : -1;
-        if (game.Version > suppliedVersion)
-        {
-            await Clients.Caller.SendAsync(
-                "GameViewUpdated",
-                projector.Project(
-                    game,
-                    playerId,
-                    drawOffer is null ? null : GameViewProjector.MapDrawOffer(game, drawOffer)),
-                Context.ConnectionAborted);
-        }
+        await Clients.Caller.SendAsync(
+            "GameViewSnapshot",
+            projector.Project(
+                game,
+                playerId,
+                drawOffer is null ? null : GameViewProjector.MapDrawOffer(game, drawOffer),
+                takebackRequest is null ? null : GameViewProjector.MapTakebackRequest(game, takebackRequest),
+                latestMove),
+            Context.ConnectionAborted);
 
         await base.OnConnectedAsync();
     }
@@ -225,6 +234,20 @@ public sealed class SignalRGameNotifier(
             value => value.GameId == game.Id &&
                 value.Status == MistChess.Infrastructure.Persistence.DrawOfferStatus.Pending,
             cancellationToken);
+        var takebackRequest = await db.TakebackRequests.AsNoTracking().SingleOrDefaultAsync(
+            value => value.GameId == game.Id &&
+                value.Status == MistChess.Infrastructure.Persistence.TakebackRequestStatus.Pending,
+            cancellationToken);
+        var resolvedTakeback = await db.TakebackRequests.AsNoTracking().SingleOrDefaultAsync(
+            value => ended &&
+                value.GameId == game.Id &&
+                value.Status == MistChess.Infrastructure.Persistence.TakebackRequestStatus.Withdrawn &&
+                value.ResolvedAtVersion == game.Version,
+            cancellationToken);
+        var latestMove = await db.Moves.AsNoTracking()
+            .Where(value => value.GameId == game.Id && value.RevertedAt == null)
+            .OrderByDescending(value => value.Ply)
+            .FirstOrDefaultAsync(cancellationToken);
         var eventName = ended ? "GameEnded" : "GameViewUpdated";
         await Task.WhenAll(
             hubContext.Clients.Group(HubGroups.GamePlayer(game.Id, game.RedPlayerId))
@@ -233,7 +256,9 @@ public sealed class SignalRGameNotifier(
                     projector.Project(
                         game,
                         game.RedPlayerId,
-                        drawOffer is null ? null : GameViewProjector.MapDrawOffer(game, drawOffer)),
+                        drawOffer is null ? null : GameViewProjector.MapDrawOffer(game, drawOffer),
+                        takebackRequest is null ? null : GameViewProjector.MapTakebackRequest(game, takebackRequest),
+                        latestMove),
                     cancellationToken),
             hubContext.Clients.Group(HubGroups.GamePlayer(game.Id, game.BlackPlayerId))
                 .SendAsync(
@@ -241,8 +266,19 @@ public sealed class SignalRGameNotifier(
                     projector.Project(
                         game,
                         game.BlackPlayerId,
-                        drawOffer is null ? null : GameViewProjector.MapDrawOffer(game, drawOffer)),
+                        drawOffer is null ? null : GameViewProjector.MapDrawOffer(game, drawOffer),
+                        takebackRequest is null ? null : GameViewProjector.MapTakebackRequest(game, takebackRequest),
+                        latestMove),
                     cancellationToken));
+        if (resolvedTakeback is not null)
+        {
+            var resolvedView = GameViewProjector.MapTakebackRequest(game, resolvedTakeback);
+            await Task.WhenAll(
+                hubContext.Clients.Group(HubGroups.GamePlayer(game.Id, game.RedPlayerId))
+                    .SendAsync("TakebackRequestChanged", resolvedView, cancellationToken),
+                hubContext.Clients.Group(HubGroups.GamePlayer(game.Id, game.BlackPlayerId))
+                    .SendAsync("TakebackRequestChanged", resolvedView, cancellationToken));
+        }
     }
 
     public async Task DrawOfferChangedAsync(Guid gameId, DrawOfferView offer, CancellationToken cancellationToken)
@@ -254,5 +290,19 @@ public sealed class SignalRGameNotifier(
                 .SendAsync("DrawOfferChanged", offer, cancellationToken),
             hubContext.Clients.Group(HubGroups.GamePlayer(game.Id, game.BlackPlayerId))
                 .SendAsync("DrawOfferChanged", offer, cancellationToken));
+    }
+
+    public async Task TakebackRequestChangedAsync(
+        Guid gameId,
+        TakebackRequestView request,
+        CancellationToken cancellationToken)
+    {
+        await using var db = await contextFactory.CreateDbContextAsync(cancellationToken);
+        var game = await db.Games.AsNoTracking().SingleAsync(value => value.Id == gameId, cancellationToken);
+        await Task.WhenAll(
+            hubContext.Clients.Group(HubGroups.GamePlayer(game.Id, game.RedPlayerId))
+                .SendAsync("TakebackRequestChanged", request, cancellationToken),
+            hubContext.Clients.Group(HubGroups.GamePlayer(game.Id, game.BlackPlayerId))
+                .SendAsync("TakebackRequestChanged", request, cancellationToken));
     }
 }

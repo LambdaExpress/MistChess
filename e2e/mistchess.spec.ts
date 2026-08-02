@@ -16,6 +16,7 @@ import type {
   MoveRequest,
   Position,
   Side,
+  TakebackRequestView,
 } from '../apps/web/src/api/types.js'
 
 interface PlayerClient {
@@ -75,6 +76,7 @@ async function installAudioProbe(context: BrowserContext): Promise<void> {
       value(this: HTMLMediaElement) {
         const soundEvent = this.dataset.soundEvent
         if (soundEvent && this.volume > 0) sounds.push(soundEvent)
+        queueMicrotask(() => this.dispatchEvent(new Event('ended')))
         return Promise.resolve()
       },
     })
@@ -221,16 +223,18 @@ function gameIdFromPage(page: Page): string {
 }
 
 async function expectGameHubConnected(page: Page): Promise<void> {
-  const connection = page.locator('.game-connection')
-  await expect(connection).toHaveAttribute('data-state', 'connected')
-  await expect(connection).toContainText('实时同步')
+  const connectionStatus = page.getByText('实时棋局已连接', { exact: true })
+  await expect(connectionStatus).toHaveClass(/sr-only/)
+  await expect(page.locator('.game-connection')).toHaveCount(0)
+  await expect(page.getByText(/LIVE GAME/)).toHaveCount(0)
+  await expect(page.getByText(/^局面版本 \d+$/)).toHaveCount(0)
 }
 
-async function domGameVersion(page: Page): Promise<number> {
-  const text = await page.getByText(/^局面版本 \d+$/).textContent()
-  const match = text?.match(/局面版本 (\d+)/)
-  if (!match) throw new Error(`Could not read game version from ${text ?? 'empty text'}`)
-  return Number(match[1])
+async function authoritativeGameVersion(page: Page): Promise<number> {
+  const gameId = gameIdFromPage(page)
+  const response = await page.request.get(`/api/games/${gameId}`)
+  expect(response.ok()).toBeTruthy()
+  return ((await response.json()) as GameView).version
 }
 
 async function domPerspective(page: Page): Promise<Side> {
@@ -404,30 +408,76 @@ async function expectBoardViewportScaling(page: Page): Promise<void> {
   expect(geometry!.centerDeltaY).toBeLessThan(1)
 }
 
+async function expectPlayerClockPlacement(page: Page, perspective: Side): Promise<void> {
+  const opponent = perspective === 'red' ? 'black' : 'red'
+  const sideName = (side: Side) => side === 'red' ? '红方' : '黑方'
+  const order = await page.locator('.board-column').evaluate((column) =>
+    Array.from(column.children)
+      .filter((element) =>
+        element.classList.contains('player-clock-bar') ||
+        element.classList.contains('game-board-stage'))
+      .map((element) => element.classList.contains('game-board-stage')
+        ? 'board'
+        : element.getAttribute('aria-label')))
+
+  expect(order).toEqual([
+    `对方${sideName(opponent)}计时`,
+    'board',
+    `我方${sideName(perspective)}计时`,
+  ])
+}
+
 async function verifyReplayPage(page: Page, testInfo: TestInfo): Promise<void> {
   await expect(page).toHaveURL(/\/history\/[^/]+$/)
   await expect(page.getByRole('heading', { name: '迷雾棋局回放' })).toBeVisible()
   const board = page.getByTestId('game-board')
+  const information = page.getByRole('group', { name: '信息视野' })
+  const orientation = page.getByRole('group', { name: '棋盘朝向' })
+  const activeInformation = information.getByRole('button', { pressed: true })
+  const activeOrientation = orientation.getByRole('button', { pressed: true })
   await expect(board).toBeVisible()
   await expect(board.locator('svg.game-board__svg')).toHaveAttribute(
     'aria-label',
-    /(红方|黑方)视野，第 0 个半回合/,
+    /(红方|黑方)视野，(红方|黑方)在下，第 0 个半回合/,
   )
   expect(await board.locator('[data-testid^="fog-"]').count()).toBeGreaterThan(0)
 
-  await page.getByRole('button', { name: '全局视野' }).click()
+  const originalInformation = await activeInformation.textContent()
+  const originalOrientation = await activeOrientation.textContent()
+  const flippedOrientation = originalOrientation === '红方在下' ? '黑方在下' : '红方在下'
+  await orientation.getByRole('button', { name: flippedOrientation }).click()
+  await expect(information.getByRole('button', { name: originalInformation ?? '' }))
+    .toHaveAttribute('aria-pressed', 'true')
+
+  await information.getByRole('button', { name: '全局视野' }).click()
+  await expect(orientation.getByRole('button', { name: flippedOrientation }))
+    .toHaveAttribute('aria-pressed', 'true')
   await expect(board.locator('[data-testid^="fog-"]')).toHaveCount(0)
-  const slider = page.getByRole('slider', { name: '回放进度' })
-  await expect(slider).toBeVisible()
-  const finalFrame = await slider.getAttribute('max')
-  expect(Number(finalFrame)).toBeGreaterThan(0)
-  await page.getByRole('button', { name: '跳到终局' }).click()
-  await expect(slider).toHaveValue(finalFrame as string)
+  expect(await board.locator('[data-testid^="visibility-"]').count()).toBeGreaterThan(0)
+  const visibilityLegend = page.locator('[aria-label="全局视野图例"]')
+  await expect(visibilityLegend).toContainText('红方盲区')
+  await expect(visibilityLegend).toContainText('黑方盲区')
+  await expect(visibilityLegend).toContainText('双方盲区')
+
+  const controls = page.locator('.replay-step-controls')
+  const previous = controls.getByRole('button', { name: '上一步' })
+  const next = controls.getByRole('button', { name: '下一步' })
+  const counter = controls.locator('.replay-step-controls__count')
+  await expect(previous).toBeDisabled()
+  await expect(next).toBeEnabled()
+  await expect(controls.getByRole('slider')).toHaveCount(0)
+  await expect(controls.getByRole('button', { name: /跳到/ })).toHaveCount(0)
+  const counterLabel = await counter.getAttribute('aria-label')
+  const total = Number(counterLabel?.match(/共 (\d+) 步/)?.[1])
+  expect(total).toBeGreaterThan(0)
+  for (let step = 0; step < total; step += 1) await next.click()
+  await expect(counter).toHaveText(`${total} / ${total}`)
+  await expect(next).toBeDisabled()
+  await expect(previous).toBeEnabled()
   await expect(board.locator('svg.game-board__svg')).toHaveAttribute(
     'aria-label',
-    /全局视野，第 \d+ 个半回合/,
+    new RegExp(`全局视野，${flippedOrientation}，第 \\d+ 个半回合`),
   )
-  await expect(page.getByText('初始局面')).toHaveCount(0)
   await expectResponsivePage(page, testInfo)
 }
 
@@ -440,13 +490,13 @@ test('real browsers decode and start the distinct move and capture audio assets'
     const playableExtension = probe.canPlayType('audio/ogg; codecs="vorbis"') ? 'ogg' : 'mp3'
     const playableSources = [
       `/audio/move.${playableExtension}`,
-      `/audio/capture.${playableExtension}`,
+      `/audio/capture-chi.${playableExtension}`,
     ]
     const sources = [
       '/audio/move.ogg',
-      '/audio/capture.ogg',
+      '/audio/capture-chi.ogg',
       '/audio/move.mp3',
-      '/audio/capture.mp3',
+      '/audio/capture-chi.mp3',
     ]
     const audioContext = new AudioContext()
     try {
@@ -482,7 +532,7 @@ test('real browsers decode and start the distinct move and capture audio assets'
   for (const extension of ['ogg', 'mp3']) {
     const move = decoded.metrics.find((metric) => metric.source === `/audio/move.${extension}`)
     const capture = decoded.metrics.find(
-      (metric) => metric.source === `/audio/capture.${extension}`,
+      (metric) => metric.source === `/audio/capture-chi.${extension}`,
     )
     expect(move).toBeDefined()
     expect(capture).toBeDefined()
@@ -620,9 +670,13 @@ test('quick match completes through the UI with isolated realtime views and reco
       domPerspective(playerB.page),
     ])
     expect(perspectiveA).not.toBe(perspectiveB)
+    await Promise.all([
+      expectPlayerClockPlacement(playerA.page, perspectiveA),
+      expectPlayerClockPlacement(playerB.page, perspectiveB),
+    ])
     const [initialVersionA, initialVersionB] = await Promise.all([
-      domGameVersion(playerA.page),
-      domGameVersion(playerB.page),
+      authoritativeGameVersion(playerA.page),
+      authoritativeGameVersion(playerB.page),
     ])
     expect(initialVersionA).toBe(initialVersionB)
 
@@ -631,10 +685,40 @@ test('quick match completes through the UI with isolated realtime views and reco
     expect(Number(playerATurn) + Number(playerBTurn)).toBe(1)
     const mover = playerATurn ? playerA : playerB
     const mutedPlayer = playerATurn ? playerB : playerA
+    await expect(mover.page.getByTestId('game-board'))
+      .toHaveClass(/game-board--my-turn/)
+    await expect(mutedPlayer.page.getByTestId('game-board'))
+      .not.toHaveClass(/game-board--my-turn/)
+
+    const drawOfferResponsePromise = waitForResponse(
+      mover.page,
+      `/api/games/${gameId}/draw-offers`,
+    )
+    await mover.page.getByRole('button', { name: '提议和棋' }).click()
+    expect((await drawOfferResponsePromise).ok()).toBeTruthy()
+    const ownDrawOverlay = mover.page.locator('.game-board-stage')
+      .getByRole('status', { name: '已提议和棋' })
+    const incomingDrawOverlay = mutedPlayer.page.locator('.game-board-stage')
+      .getByRole('alertdialog', { name: '对手提议和棋' })
+    await Promise.all([
+      expect(ownDrawOverlay).toBeVisible(),
+      expect(incomingDrawOverlay).toBeVisible(),
+      expect(incomingDrawOverlay.getByRole('button', { name: '同意' })).toBeFocused(),
+    ])
+    const rejectDrawResponsePromise = waitForResponse(
+      mutedPlayer.page,
+      `/api/games/${gameId}/draw-offers/reject`,
+    )
+    await incomingDrawOverlay.getByRole('button', { name: '拒绝' }).click()
+    expect((await rejectDrawResponsePromise).ok()).toBeTruthy()
+    await Promise.all([
+      expect(mover.page.locator('.game-negotiation-overlay')).toHaveCount(0),
+      expect(mutedPlayer.page.locator('.game-negotiation-overlay')).toHaveCount(0),
+    ])
     const moverBefore = await currentGame(mover, gameId)
     expect(moverBefore.clock).not.toBeNull()
-    await expect.poll(() => playedSounds(mover.page)).toContain('game-start')
-    await expect.poll(() => playedSounds(mutedPlayer.page)).toContain('game-start')
+    await expect.poll(() => playedSounds(mover.page)).toContain('match-found')
+    await expect.poll(() => playedSounds(mutedPlayer.page)).toContain('match-found')
     const mutedSoundsBeforeMove = (await playedSounds(mutedPlayer.page)).length
     const muteButton = mutedPlayer.page.getByRole('button', { name: '音效开启' })
     await expect(muteButton).toHaveAttribute('aria-pressed', 'true')
@@ -644,14 +728,14 @@ test('quick match completes through the UI with isolated realtime views and reco
     await submitFirstBoardMove(mover.page, gameId)
 
     await Promise.all([
-      expect.poll(() => domGameVersion(playerA.page)).toBeGreaterThan(initialVersionA),
-      expect.poll(() => domGameVersion(playerB.page)).toBeGreaterThan(initialVersionB),
+      expect.poll(() => authoritativeGameVersion(playerA.page)).toBeGreaterThan(initialVersionA),
+      expect.poll(() => authoritativeGameVersion(playerB.page)).toBeGreaterThan(initialVersionB),
       expect.poll(() => gameViews(gameCaptureA).length).toBeGreaterThan(0),
       expect.poll(() => gameViews(gameCaptureB).length).toBeGreaterThan(0),
     ])
-    const [movedVersionA, movedVersionB] = await Promise.all([
-      domGameVersion(playerA.page),
-      domGameVersion(playerB.page),
+    let [movedVersionA, movedVersionB] = await Promise.all([
+      authoritativeGameVersion(playerA.page),
+      authoritativeGameVersion(playerB.page),
     ])
     expect(movedVersionA).toBe(movedVersionB)
     const moverAfter = await currentGame(mover, gameId)
@@ -669,6 +753,86 @@ test('quick match completes through the UI with isolated realtime views and reco
     await mutedPlayer.page.getByRole('button', { name: '音效静音' }).click()
     await expect(mutedPlayer.page.getByRole('button', { name: '音效开启' }))
       .toHaveAttribute('aria-pressed', 'true')
+
+    const requestTakeback = mover.page.getByRole('button', { name: '请求悔棋' })
+    await expect(requestTakeback).toBeVisible()
+    await expect(mutedPlayer.page.getByRole('button', { name: '请求悔棋' }))
+      .toHaveCount(0)
+    const takebackResponsePromise = waitForResponse(
+      mover.page,
+      `/api/games/${gameId}/takeback-requests`,
+    )
+    await requestTakeback.click()
+    const takebackResponse = await takebackResponsePromise
+    expect(takebackResponse.ok()).toBeTruthy()
+    const takeback = await takebackResponse.json() as TakebackRequestView
+    expect(takeback.requestedAtVersion).toBe(movedVersionA)
+    expect(takeback.requestedBy).toBe(moverBefore.perspective)
+
+    const ownTakebackOverlay = mover.page.locator('.game-board-stage')
+      .getByRole('status', { name: '已请求悔棋' })
+    const incomingTakebackOverlay = mutedPlayer.page.locator('.game-board-stage')
+      .getByRole('alertdialog', { name: '对手请求悔棋' })
+    await Promise.all([
+      expect(ownTakebackOverlay).toBeVisible(),
+      expect(incomingTakebackOverlay).toContainText(`第 ${takeback.requestedPly} 手`),
+      expect(incomingTakebackOverlay.getByRole('button', { name: '同意' })).toBeFocused(),
+    ])
+    const soundsBeforeTakeback = await Promise.all([
+      playedSounds(mover.page),
+      playedSounds(mutedPlayer.page),
+    ])
+    const acceptTakebackResponsePromise = waitForResponse(
+      mutedPlayer.page,
+      `/api/games/${gameId}/takeback-requests/${takeback.id}/accept`,
+    )
+    await incomingTakebackOverlay.getByRole('button', { name: '同意' }).click()
+    const acceptTakebackResponse = await acceptTakebackResponsePromise
+    expect(acceptTakebackResponse.ok()).toBeTruthy()
+    const acceptedTakebackView = await acceptTakebackResponse.json() as GameView
+    expect(acceptedTakebackView.version).toBeGreaterThan(movedVersionA)
+    expect(acceptedTakebackView.sideToMove).toBe(moverBefore.perspective)
+    expect(acceptedTakebackView.lastAction?.kind).toBe('takebackAccepted')
+    expect(acceptedTakebackView.takebackRequest).toBeNull()
+    expect(acceptedTakebackView.canRequestTakeback).toBe(false)
+    await Promise.all([
+      expect.poll(() => authoritativeGameVersion(playerA.page))
+        .toBe(acceptedTakebackView.version),
+      expect.poll(() => authoritativeGameVersion(playerB.page))
+        .toBe(acceptedTakebackView.version),
+      expect(mover.page.getByRole('heading', { name: '轮到你行棋' })).toBeVisible(),
+      expect(mover.page.locator('.game-negotiation-overlay')).toHaveCount(0),
+      expect(mutedPlayer.page.locator('.game-negotiation-overlay')).toHaveCount(0),
+    ])
+    expect(await playedSounds(mover.page)).toEqual(soundsBeforeTakeback[0])
+    expect(await playedSounds(mutedPlayer.page)).toEqual(soundsBeforeTakeback[1])
+    await expect(mover.page.getByTestId('game-board'))
+      .toHaveClass(/game-board--my-turn/)
+
+    const moverMovesBeforeResumedMove = soundsBeforeTakeback[0]
+      .filter((sound) => sound === 'move-self').length
+    const opponentMovesBeforeResumedMove = soundsBeforeTakeback[1]
+      .filter((sound) => sound === 'move-opponent').length
+    await submitFirstBoardMove(mover.page, gameId)
+    await Promise.all([
+      expect.poll(async () => (await playedSounds(mover.page))
+        .filter((sound) => sound === 'move-self').length)
+        .toBe(moverMovesBeforeResumedMove + 1),
+      expect.poll(async () => (await playedSounds(mutedPlayer.page))
+        .filter((sound) => sound === 'move-opponent').length)
+        .toBe(opponentMovesBeforeResumedMove + 1),
+    ])
+    const resumedVersions = await Promise.all([
+      authoritativeGameVersion(playerA.page),
+      authoritativeGameVersion(playerB.page),
+    ])
+    ;[movedVersionA, movedVersionB] = resumedVersions
+    expect(movedVersionA).toBe(movedVersionB)
+    expect(movedVersionA).toBeGreaterThan(acceptedTakebackView.version)
+    await expect(mover.page.getByTestId('game-board'))
+      .not.toHaveClass(/game-board--my-turn/)
+    await expect(mutedPlayer.page.getByTestId('game-board'))
+      .toHaveClass(/game-board--my-turn/)
 
     const [viewA, viewB, fogA, fogB] = await Promise.all([
       currentGame(playerA, gameId),
@@ -716,7 +880,7 @@ test('quick match completes through the UI with isolated realtime views and reco
     const recoveredSocket = recoveredSockets.findLast((socket) => !socket.isClosed())
     if (!recoveredSocket) throw new Error('Reopened game did not establish a live GameHub socket')
     const recoveredCaptureA = captureHub(recoveredSocket)
-    expect(await domGameVersion(playerA.page)).toBe(movedVersionA)
+    expect(await authoritativeGameVersion(playerA.page)).toBe(movedVersionA)
     await expect(offlineNotice).toHaveCount(0)
     await expectResponsivePage(playerA.page, testInfo)
 
@@ -875,10 +1039,16 @@ test('mobile portrait completes a normal move and capture without landscape regr
     await expect(red.page.getByRole('heading', { name: '轮到你行棋' })).toBeVisible()
     await submitBoardMove(red.page, gameId, '0:4', '0:5')
 
-    await expect.poll(() => playedSounds(red.page)).toContain('move-self')
-    await expect.poll(() => playedSounds(red.page)).toContain('capture')
-    await expect.poll(() => playedSounds(black.page)).toContain('move-self')
-    await expect.poll(() => playedSounds(black.page)).toContain('capture')
+    await Promise.all([
+      expect.poll(async () => (await playedSounds(red.page))
+        .filter((sound) => sound === 'move-self').length).toBe(1),
+      expect.poll(async () => (await playedSounds(red.page))
+        .filter((sound) => sound === 'capture').length).toBe(1),
+      expect.poll(async () => (await playedSounds(black.page))
+        .filter((sound) => sound === 'move-self').length).toBe(1),
+      expect.poll(async () => (await playedSounds(black.page))
+        .filter((sound) => sound === 'capture').length).toBe(1),
+    ])
 
     await red.page.setViewportSize({ width: 740, height: 393 })
     const landscapeMedia = await red.page.evaluate(() => ({
@@ -1054,6 +1224,7 @@ test.describe('administrator player lifecycle', () => {
       const banReason = '管理员端到端验证：破坏公平对局。'
 
       adminContext = await browser.newContext(browserContextOptions(testInfo, 2))
+      await installAudioProbe(adminContext)
       const adminPage = await adminContext.newPage()
       await adminPage.goto('/admin/login')
       await expect(adminPage.getByRole('heading', { name: '管理员登录' })).toBeVisible()
@@ -1113,34 +1284,68 @@ test.describe('administrator player lifecycle', () => {
       await expect(adminPage.getByText('管理员封禁判负', { exact: true })).toBeVisible()
 
       const replayBoard = adminPage.getByTestId('game-board')
-      const replayModes = adminPage.getByRole('group', { name: '回放视野' })
-      const replaySlider = adminPage.getByRole('slider', { name: '回放进度' })
-      const finalFrame = await replaySlider.getAttribute('max')
-      expect(Number(finalFrame)).toBeGreaterThan(0)
-      await adminPage.getByRole('button', { name: '跳到终局' }).click()
-      await expect(replaySlider).toHaveValue(finalFrame as string)
+      const replayInformation = adminPage.getByRole('group', { name: '信息视野' })
+      const replayOrientation = adminPage.getByRole('group', { name: '棋盘朝向' })
+      await expect(replayInformation.getByRole('button', { name: '全局视野' }))
+        .toHaveAttribute('aria-pressed', 'true')
+      await expect(replayOrientation.getByRole('button', { name: '红方在下' }))
+        .toHaveAttribute('aria-pressed', 'true')
 
-      await replayModes.getByRole('button', { name: '红方视野' }).click()
+      const replayControls = adminPage.locator('.replay-step-controls')
+      const replayPrevious = replayControls.getByRole('button', { name: '上一步' })
+      const replayNext = replayControls.getByRole('button', { name: '下一步' })
+      const replayCounter = replayControls.locator('output')
+      await expect(replayControls.getByRole('button')).toHaveCount(2)
+      await expect(replayCounter).toHaveCount(1)
+      await expect(adminPage.getByRole('slider')).toHaveCount(0)
+      await expect(adminPage.getByRole('button', { name: /跳到/ })).toHaveCount(0)
+      const replayCounterLabel = await replayCounter.getAttribute('aria-label')
+      const finalFrame = Number(replayCounterLabel?.match(/共 (\d+) 步/)?.[1])
+      expect(finalFrame).toBeGreaterThan(0)
+      await expect(replayPrevious).toBeDisabled()
+      for (let step = 0; step < finalFrame; step += 1) await replayNext.click()
+      await expect(replayCounter).toHaveText(`${finalFrame} / ${finalFrame}`)
+      await expect(replayNext).toBeDisabled()
+
+      await replayOrientation.getByRole('button', { name: '黑方在下' }).click()
+      await expect(replayInformation.getByRole('button', { name: '全局视野' }))
+        .toHaveAttribute('aria-pressed', 'true')
+      await replayInformation.getByRole('button', { name: '红方视野' }).click()
+      await expect(replayOrientation.getByRole('button', { name: '黑方在下' }))
+        .toHaveAttribute('aria-pressed', 'true')
       await expect(replayBoard.locator('svg.game-board__svg')).toHaveAttribute(
         'aria-label',
-        /红方视野，第 \d+ 个半回合/,
+        /红方视野，黑方在下，第 \d+ 个半回合/,
       )
       expect(await replayBoard.locator('[data-testid^="fog-"]').count()).toBeGreaterThan(0)
 
-      await replayModes.getByRole('button', { name: '黑方视野' }).click()
+      await replayInformation.getByRole('button', { name: '黑方视野' }).click()
       await expect(replayBoard.locator('svg.game-board__svg')).toHaveAttribute(
         'aria-label',
-        /黑方视野，第 \d+ 个半回合/,
+        /黑方视野，黑方在下，第 \d+ 个半回合/,
       )
       expect(await replayBoard.locator('[data-testid^="fog-"]').count()).toBeGreaterThan(0)
 
-      await replayModes.getByRole('button', { name: '全局视野' }).click()
+      await replayInformation.getByRole('button', { name: '全局视野' }).click()
       await expect(replayBoard.locator('svg.game-board__svg')).toHaveAttribute(
         'aria-label',
-        /全局视野，第 \d+ 个半回合/,
+        /全局视野，黑方在下，第 \d+ 个半回合/,
       )
       await expect(replayBoard.locator('[data-testid^="fog-"]')).toHaveCount(0)
+      expect(await replayBoard.locator('[data-testid^="visibility-"]').count())
+        .toBeGreaterThan(0)
+      await expect(adminPage.locator('[aria-label="全局视野图例"]'))
+        .toContainText('双方盲区')
       await expectResponsivePage(adminPage, testInfo)
+      if (testInfo.project.name !== 'mobile-chromium') {
+        const replayViewport = await adminPage.evaluate(() => ({
+          contentHeight: document.documentElement.scrollHeight,
+          viewportHeight: window.innerHeight,
+        }))
+        expect(replayViewport.contentHeight).toBeLessThanOrEqual(
+          replayViewport.viewportHeight + 1,
+        )
+      }
 
       await adminPage.goBack()
       await expect(

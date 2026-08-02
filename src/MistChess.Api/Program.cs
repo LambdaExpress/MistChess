@@ -99,6 +99,7 @@ builder.Services.AddScoped<AdminUserService>();
 builder.Services.AddScoped<RoomService>();
 builder.Services.AddScoped<MatchmakingService>();
 builder.Services.AddScoped<GameService>();
+builder.Services.AddScoped<TakebackService>();
 builder.Services.AddScoped<HistoryService>();
 builder.Services.AddSingleton<GameConnectionTracker>();
 builder.Services.AddSingleton<ILobbyNotifier, SignalRLobbyNotifier>();

@@ -20,6 +20,21 @@ public enum DrawOfferStatus
     Withdrawn
 }
 
+public enum TakebackRequestStatus
+{
+    Pending,
+    Accepted,
+    Rejected,
+    Withdrawn
+}
+
+public enum GameActionKind
+{
+    Move,
+    Capture,
+    TakebackAccepted
+}
+
 public enum GameResultReason
 {
     GeneralCaptured,
@@ -184,6 +199,10 @@ public sealed record GameView(
     CaptureSummaryView CaptureSummary,
     ClockView? Clock,
     DrawOfferView? DrawOffer,
+    long NegotiationVersion,
+    TakebackRequestView? TakebackRequest,
+    GameActionView? LastAction,
+    bool CanRequestTakeback,
     int? MoveTimeLimitSeconds = null);
 
 public sealed record MoveRequest(
@@ -192,7 +211,23 @@ public sealed record MoveRequest(
     [Range(0, long.MaxValue)][property: JsonRequired] long ExpectedVersion,
     [Required, MinLength(1), MaxLength(64)][property: JsonRequired] string ClientMoveId);
 
-public sealed record DrawOfferView(DrawOfferStatus Status, Side OfferedBy);
+public sealed record CreateTakebackRequest(
+    [Range(0, long.MaxValue)][property: JsonRequired] long ExpectedVersion,
+    [Required, MinLength(1), MaxLength(64)][property: JsonRequired] string ClientRequestId);
+
+public sealed record DrawOfferView(Guid Id, DrawOfferStatus Status, Side OfferedBy, long Revision);
+
+public sealed record TakebackRequestView(
+    Guid Id,
+    TakebackRequestStatus Status,
+    Side RequestedBy,
+    int RequestedPly,
+    long RequestedAtVersion,
+    long? ResolvedAtVersion,
+    DateTimeOffset CreatedAt,
+    long Revision);
+
+public sealed record GameActionView(long Version, GameActionKind Kind, Side Actor);
 
 public sealed record ReplayMoveView(
     int Ply,

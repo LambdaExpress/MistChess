@@ -12,6 +12,7 @@ export function AdminLayout() {
   const loginPage = location.pathname === '/admin/login'
   const protectedPage = location.pathname.startsWith('/admin/users')
     || location.pathname.startsWith('/admin/games')
+  const replayPage = location.pathname.startsWith('/admin/games/')
   const onlineUsersPage = location.pathname === '/admin/users'
     && new URLSearchParams(location.search).get('online') === 'online'
   const adminChannelRef = useRef<BroadcastChannel | null>(null)
@@ -86,7 +87,7 @@ export function AdminLayout() {
   }, [expireSession, protectedPage, sessionQuery.data])
 
   return (
-    <div className={`admin-shell${loginPage ? ' admin-shell--login' : ''}`}>
+    <div className={`admin-shell${loginPage ? ' admin-shell--login' : ''}${replayPage ? ' admin-shell--replay' : ''}`}>
       <header className="admin-header">
         <Link to="/admin" className="admin-brand" aria-label="迷雾象棋管理后台首页">
           <span className="admin-brand__seal" aria-hidden="true">雾</span>
