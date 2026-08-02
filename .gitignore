@@ -24,6 +24,9 @@ _ReSharper*/
 *.DotSettings.user
 *.sln.iml
 
+# Local AI tooling
+/.omp/
+
 # Node and frontend output
 **/node_modules/
 **/dist/
