@@ -2156,7 +2156,7 @@ p {
   shape-rendering: geometricPrecision;
 }
 
-.legend-swatch--red-blind {
+.legend-swatch--red-visible {
   border: 1px solid color-mix(in srgb, var(--red) 72%, var(--line));
   background:
     repeating-linear-gradient(
@@ -2167,7 +2167,7 @@ p {
     var(--paper-deep);
 }
 
-.legend-swatch--black-blind {
+.legend-swatch--black-visible {
   border: 1px solid color-mix(in srgb, var(--ink) 72%, var(--line));
   background:
     repeating-linear-gradient(
@@ -2178,7 +2178,7 @@ p {
     var(--paper-deep);
 }
 
-.legend-swatch--both-blind {
+.legend-swatch--neither-visible {
   border: 1px solid color-mix(in srgb, var(--ink) 64%, var(--red));
   background:
     repeating-linear-gradient(

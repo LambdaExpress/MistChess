@@ -162,7 +162,7 @@ describe('GameBoard', () => {
       .getByText('红方车，位于9路、10线')).toBeInTheDocument()
   })
 
-  it('marks red-only, black-only, and shared blind squares in omniscient view', () => {
+  it('marks red-only, black-only, and unseen squares in omniscient view', () => {
     render(
       <GameBoard
         view={createView()}
@@ -175,23 +175,25 @@ describe('GameBoard', () => {
 
     expect(screen.queryByTestId('visibility-0:0')).not.toBeInTheDocument()
     expect(screen.getByTestId('visibility-1:0'))
-      .toHaveAttribute('data-black-blind', 'true')
+      .toHaveAttribute('data-red-visible', 'true')
     expect(screen.getByTestId('visibility-1:0'))
-      .not.toHaveAttribute('data-red-blind')
+      .not.toHaveAttribute('data-black-visible')
     expect(screen.getByTestId('visibility-1:0'))
-      .toHaveAttribute('fill', 'url(#black-blind-pattern)')
+      .toHaveAttribute('fill', 'url(#red-visible-pattern)')
     expect(screen.getByTestId('visibility-2:0'))
-      .toHaveAttribute('data-red-blind', 'true')
+      .toHaveAttribute('data-black-visible', 'true')
     expect(screen.getByTestId('visibility-2:0'))
-      .not.toHaveAttribute('data-black-blind')
+      .not.toHaveAttribute('data-red-visible')
     expect(screen.getByTestId('visibility-2:0'))
-      .toHaveAttribute('fill', 'url(#red-blind-pattern)')
+      .toHaveAttribute('fill', 'url(#black-visible-pattern)')
     expect(screen.getByTestId('visibility-3:0'))
-      .toHaveAttribute('data-red-blind', 'true')
+      .toHaveAttribute('data-neither-visible', 'true')
     expect(screen.getByTestId('visibility-3:0'))
-      .toHaveAttribute('data-black-blind', 'true')
+      .not.toHaveAttribute('data-red-visible')
     expect(screen.getByTestId('visibility-3:0'))
-      .toHaveAttribute('fill', 'url(#both-blind-pattern)')
+      .not.toHaveAttribute('data-black-visible')
+    expect(screen.getByTestId('visibility-3:0'))
+      .toHaveAttribute('fill', 'url(#neither-visible-pattern)')
     expect(screen.queryByTestId('fog-3:0')).not.toBeInTheDocument()
   })
 })

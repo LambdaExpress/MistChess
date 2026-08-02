@@ -177,7 +177,7 @@ describe('ReplayPage', () => {
       name: '全局视野，黑方在下，第 1 个半回合',
     })).toBeInTheDocument()
     expect(screen.getByLabelText('全局视野图例'))
-      .toHaveTextContent('红方盲区黑方盲区双方盲区双方可见')
+      .toHaveTextContent('红方可见黑方可见双方不可见双方可见')
     expect(getReplay).toHaveBeenCalledOnce()
 
     fireEvent.click(screen.getByRole('button', { name: '生成分享链接' }))

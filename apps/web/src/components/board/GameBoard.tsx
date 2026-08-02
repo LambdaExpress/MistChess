@@ -202,15 +202,15 @@ export function GameBoard({
             <rect width="10" height="10" fill="#172321" />
             <path d="M0 10 10 0" stroke="#273936" strokeWidth="2" />
           </pattern>
-          <pattern id="red-blind-pattern" width="12" height="12" patternUnits="userSpaceOnUse">
+          <pattern id="red-visible-pattern" width="12" height="12" patternUnits="userSpaceOnUse">
             <rect width="12" height="12" fill="#b4232f" fillOpacity="0.28" />
             <path d="M-3 12 12 -3 M3 15 15 3" stroke="#e85b63" strokeOpacity="0.42" strokeWidth="2" />
           </pattern>
-          <pattern id="black-blind-pattern" width="12" height="12" patternUnits="userSpaceOnUse">
+          <pattern id="black-visible-pattern" width="12" height="12" patternUnits="userSpaceOnUse">
             <rect width="12" height="12" fill="#101716" fillOpacity="0.32" />
             <path d="M-3 -3 15 15 M-3 9 3 15" stroke="#45504e" strokeOpacity="0.5" strokeWidth="2" />
           </pattern>
-          <pattern id="both-blind-pattern" width="12" height="12" patternUnits="userSpaceOnUse">
+          <pattern id="neither-visible-pattern" width="12" height="12" patternUnits="userSpaceOnUse">
             <rect width="12" height="12" fill="#b4232f" fillOpacity="0.24" />
             <path d="M-3 -3 15 15 M-3 9 3 15" stroke="#101716" strokeOpacity="0.72" strokeWidth="5" />
           </pattern>
@@ -300,15 +300,16 @@ export function GameBoard({
           <g className="omniscient-visibility-layer" aria-hidden="true">
             {allPositions.map((position) => {
               const key = positionKey(position)
-              const redBlind = !omniscientVisibleKeys.red.has(key)
-              const blackBlind = !omniscientVisibleKeys.black.has(key)
-              if (!redBlind && !blackBlind) return null
+              const redVisible = omniscientVisibleKeys.red.has(key)
+              const blackVisible = omniscientVisibleKeys.black.has(key)
+              if (redVisible && blackVisible) return null
+              const neitherVisible = !redVisible && !blackVisible
               const point = boardPoint(position, orientation)
-              const fill = redBlind && blackBlind
-                ? 'url(#both-blind-pattern)'
-                : redBlind
-                  ? 'url(#red-blind-pattern)'
-                  : 'url(#black-blind-pattern)'
+              const fill = neitherVisible
+                ? 'url(#neither-visible-pattern)'
+                : redVisible
+                  ? 'url(#red-visible-pattern)'
+                  : 'url(#black-visible-pattern)'
               return (
                 <rect
                   key={key}
@@ -319,8 +320,9 @@ export function GameBoard({
                   rx="9"
                   fill={fill}
                   data-testid={`visibility-${key}`}
-                  data-red-blind={redBlind || undefined}
-                  data-black-blind={blackBlind || undefined}
+                  data-red-visible={redVisible || undefined}
+                  data-black-visible={blackVisible || undefined}
+                  data-neither-visible={neitherVisible || undefined}
                 />
               )
             })}

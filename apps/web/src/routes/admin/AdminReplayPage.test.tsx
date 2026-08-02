@@ -117,19 +117,15 @@ describe('AdminReplayPage', () => {
       name: '全局视野，红方在下，第 0 个半回合',
     })).toBeInTheDocument()
     expect(screen.getByTestId('visibility-0:0')).toHaveAttribute(
-      'data-black-blind',
+      'data-red-visible',
       'true',
     )
     expect(screen.getByTestId('visibility-8:9')).toHaveAttribute(
-      'data-red-blind',
+      'data-black-visible',
       'true',
     )
     expect(screen.getByTestId('visibility-4:4')).toHaveAttribute(
-      'data-red-blind',
-      'true',
-    )
-    expect(screen.getByTestId('visibility-4:4')).toHaveAttribute(
-      'data-black-blind',
+      'data-neither-visible',
       'true',
     )
 

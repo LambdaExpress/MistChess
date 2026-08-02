@@ -205,9 +205,9 @@ export function AdminReplayPage() {
           <aside className="admin-replay-tools" aria-label="回放辅助信息与控制">
             {visibilityMode === 'omniscient' ? (
               <div className="board-legend admin-replay-visibility-legend" aria-label="全局视野图例">
-                <span><i className="legend-swatch legend-swatch--red-blind" />红方盲区</span>
-                <span><i className="legend-swatch legend-swatch--black-blind" />黑方盲区</span>
-                <span><i className="legend-swatch legend-swatch--both-blind" />双方盲区</span>
+                <span><i className="legend-swatch legend-swatch--red-visible" />红方可见</span>
+                <span><i className="legend-swatch legend-swatch--black-visible" />黑方可见</span>
+                <span><i className="legend-swatch legend-swatch--neither-visible" />双方不可见</span>
                 <span><i className="legend-swatch legend-swatch--visible" />双方可见</span>
               </div>
             ) : null}
